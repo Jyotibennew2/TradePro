@@ -1,5 +1,8 @@
 .env
+.env.backup
 __pycache__/
 *.pyc
 *.log
-.env.backup
+fyersApi.log
+fyersRequests.log
+boot.log
