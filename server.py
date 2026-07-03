@@ -7,25 +7,37 @@ Compatible with Python 3.11+, Termux, Linux.
 import time
 import math
 import random
-import logging
 from datetime import datetime
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from backend.config import APP_ID, SECRET, REDIRECT_URL
-from backend.pricing import bs
+from backend.logger    import setup_logging, get_logger
+from backend.config    import APP_ID, SECRET, REDIRECT_URL, validate, summary
+from backend.pricing   import bs
+from backend.response  import success, error
+from backend.validators import (
+    validate_symbol, validate_expiry, validate_strike_count,
+    validate_quantity, validate_price, validate_strategy, validate_days,
+)
 from backend.fyers_service import FyersService
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — must be first
 # ---------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
+setup_logging()
+logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config validation at startup
+# ---------------------------------------------------------------------------
+
+missing = validate()
+if missing:
+    logger.warning(f"Missing config fields: {missing} — running in MOCK mode")
+else:
+    logger.info(f"Config OK: {summary()}")
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -35,6 +47,44 @@ app = Flask(__name__)
 CORS(app)
 
 _svc = FyersService(app_id=APP_ID, secret=SECRET, redirect_url=REDIRECT_URL)
+
+# ---------------------------------------------------------------------------
+# Request logging middleware
+# ---------------------------------------------------------------------------
+
+@app.before_request
+def _log_request() -> None:
+    logger.info(f"→ {request.method} {request.path} args={dict(request.args)}")
+
+
+@app.after_request
+def _log_response(resp):
+    logger.info(f"← {request.method} {request.path} status={resp.status_code}")
+    return resp
+
+# ---------------------------------------------------------------------------
+# Global error handlers
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(400)
+def bad_request(e):
+    return error(str(e), 400)
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return error("Endpoint not found", 404)
+
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return error("Method not allowed", 405)
+
+
+@app.errorhandler(500)
+def internal_error(e):
+    logger.exception(f"Internal server error: {e}")
+    return error("Internal server error", 500)
 
 # ---------------------------------------------------------------------------
 # Health
@@ -65,7 +115,7 @@ def auth_url():
         return jsonify({"success": True, "url": s.generate_authcode()})
     except Exception as e:
         logger.error(f"Auth URL error: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        return error(str(e), 500)
 
 
 @app.route("/api/auth/token", methods=["POST"])
@@ -86,10 +136,10 @@ def auth_token():
                 f.write(f"\nFYERS_ACCESS_TOKEN={tok}")
             logger.info("Token updated successfully")
             return jsonify({"success": True, "message": "Authenticated!"})
-        return jsonify({"success": False, "error": "No token received"})
+        return error("No token received", 400)
     except Exception as e:
         logger.error(f"Auth token error: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        return error(str(e), 500)
 
 # ---------------------------------------------------------------------------
 # Quotes
@@ -107,9 +157,27 @@ def quotes():
 @app.route("/api/optionchain")
 def option_chain():
     symbol = request.args.get("symbol", "NIFTY")
-    count  = int(request.args.get("strikecount", "10"))
     expiry = request.args.get("expiry", "")
-    return jsonify(_svc.get_option_chain(symbol=symbol, expiry=expiry, strike_count=count))
+    count  = request.args.get("strikecount", "10")
+
+    # Validate
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+
+    ok, msg = validate_expiry(expiry)
+    if not ok:
+        return error(msg, 400)
+
+    ok, msg = validate_strike_count(count)
+    if not ok:
+        return error(msg, 400)
+
+    return jsonify(_svc.get_option_chain(
+        symbol=symbol,
+        expiry=expiry,
+        strike_count=int(count),
+    ))
 
 # ---------------------------------------------------------------------------
 # Positions
@@ -133,7 +201,17 @@ def orders():
 
 @app.route("/api/placeorder", methods=["POST"])
 def placeorder():
-    return jsonify(_svc.place_order(request.json or {}))
+    data = request.json or {}
+
+    ok, msg = validate_quantity(data.get("qty"))
+    if not ok:
+        return error(msg, 400)
+
+    ok, msg = validate_price(data.get("limitPrice"))
+    if not ok:
+        return error(msg, 400)
+
+    return jsonify(_svc.place_order(data))
 
 # ---------------------------------------------------------------------------
 # Funds
@@ -151,20 +229,30 @@ def funds():
 def backtest():
     b        = request.json or {}
     strategy = b.get("strategy", "straddle")
-    days     = int(b.get("days", 90))
+    days     = b.get("days", 90)
     sl_pct   = float(b.get("sl_pct", 50))
     tgt_pct  = float(b.get("tgt_pct", 50))
     lot_size = int(b.get("lot_size", 50))
 
-    p       = 22480 * 0.88
-    candles = []
+    # Validate
+    ok, msg = validate_strategy(strategy)
+    if not ok:
+        return error(msg, 400)
+
+    ok, msg = validate_days(days)
+    if not ok:
+        return error(msg, 400)
+
+    days = int(days)
+    p    = 22480 * 0.88
+    candles: list = []
     for i in range(days, -1, -1):
         p *= (1 + (random.random() - 0.47) * 0.012)
         candles.append({"c": round(p, 2), "t": int(time.time()) - i * 86400})
 
-    trades: list = []
-    rpnl = peak = 0.0
-    mdd  = 0.0
+    trades: list  = []
+    rpnl = peak   = 0.0
+    mdd           = 0.0
 
     for day in candles:
         S   = day["c"]
@@ -220,7 +308,6 @@ def backtest():
     wins   = [t for t in trades if t["win"]]
     losses = [t for t in trades if not t["win"]]
     tot    = len(trades)
-
     eq     = 0.0
     equity = []
     for t in trades:

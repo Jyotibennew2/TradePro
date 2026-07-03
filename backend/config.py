@@ -1,6 +1,6 @@
 """
 TradePro Backend - Configuration
-Loads all environment variables from .env file.
+Loads and validates environment variables from .env file.
 Compatible with Python 3.11+, Termux, Linux.
 """
 
@@ -48,18 +48,43 @@ PIN          : str = os.environ.get("FYERS_PIN", "")
 TOTP_KEY     : str = os.environ.get("FYERS_TOTP_KEY", "")
 
 # ---------------------------------------------------------------------------
-# Validation helpers
+# Required fields
 # ---------------------------------------------------------------------------
+
+_REQUIRED: dict[str, str] = {
+    "FYERS_APP_ID"    : APP_ID,
+    "FYERS_SECRET_KEY": SECRET,
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate() -> list[str]:
+    """
+    Validate all required config fields.
+    Returns list of missing field names (empty = all good).
+    """
+    missing = []
+    for name, val in _REQUIRED.items():
+        if not val:
+            missing.append(name)
+            logger.error(f"Missing required config: {name}")
+    if not missing:
+        logger.info("Config validation passed")
+    return missing
+
 
 def is_configured() -> bool:
     """Return True only if all required fields are present."""
     return bool(APP_ID and SECRET and TOKEN)
 
+
 def summary() -> dict:
     """Return config summary — safe to log (no secrets)."""
     return {
-        "app_id"     : APP_ID,
-        "token_set"  : bool(TOKEN),
+        "app_id"      : APP_ID,
+        "token_set"   : bool(TOKEN),
         "redirect_url": REDIRECT_URL,
-        "configured" : is_configured(),
+        "configured"  : is_configured(),
     }
