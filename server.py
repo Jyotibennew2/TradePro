@@ -224,11 +224,11 @@ def backtest():
         return error(msg, 400)
 
     days = int(days)
-    p    = 22480 * 0.88
-    candles: list = []
-    for i in range(days, -1, -1):
-        p *= (1 + (random.random() - 0.47) * 0.012)
-        candles.append({"c": round(p, 2), "t": int(time.time()) - i * 86400})
+    hist = _market.get_historical("NIFTY", days=days, interval="1D")
+    raw_candles = hist.get("candles", [])
+    if not raw_candles:
+        return error("No historical data available", 500)
+    candles = [{"c": c["close"], "t": c["t"]} for c in raw_candles]
 
     trades: list = []
     rpnl = peak  = 0.0

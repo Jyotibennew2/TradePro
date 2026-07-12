@@ -85,7 +85,7 @@ class MarketDataService:
         return result
 
     # ------------------------------------------------------------------
-    # Historical candles (mock — replace with Fyers history API)
+    # Historical candles
     # ------------------------------------------------------------------
 
     def get_historical(
@@ -96,35 +96,24 @@ class MarketDataService:
     ) -> dict:
         """
         Return historical OHLCV candles.
-        Mock data — connect Fyers history API for live data.
+        Delegates to FyersService.get_history() — returns real Fyers data
+        when authenticated, realistic mock data otherwise.
         """
         cache_key = f"hist:{symbol}:{days}:{interval}"
         cached    = chain_cache.get(cache_key)
         if cached:
             return cached
 
-        # Mock candle generation
-        base   = {"NIFTY": 24300.0, "BANKNIFTY": 58000.0}.get(symbol.upper(), 24300.0)
-        price  = base * 0.90
-        candles= []
-        now    = int(time.time())
+        resolution = "D" if interval in ("1D", "D") else interval
+        hist       = self._svc.get_history(symbol, days=days, resolution=resolution)
 
-        for i in range(days, -1, -1):
-            price  *= (1 + (random.random() - 0.49) * 0.015)
-            high    = price * (1 + random.random() * 0.008)
-            low     = price * (1 - random.random() * 0.008)
-            open_   = price * (1 + (random.random() - 0.5) * 0.005)
-            volume  = int(random.uniform(500000, 2000000))
-            candles.append({
-                "t"     : now - i * 86400,
-                "open"  : round(open_, 2),
-                "high"  : round(high,  2),
-                "low"   : round(low,   2),
-                "close" : round(price, 2),
-                "volume": volume,
-            })
-
-        result = {"success": True, "symbol": symbol, "interval": interval, "candles": candles, "mock": True}
+        result = {
+            "success" : hist.get("success", True),
+            "symbol"  : symbol,
+            "interval": interval,
+            "candles" : hist.get("candles", []),
+            "mock"    : hist.get("mock", True),
+        }
         chain_cache.set(cache_key, result, ttl=300)
         return result
 

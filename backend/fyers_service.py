@@ -9,6 +9,7 @@ import hmac
 import time
 import base64
 import math
+import random
 import struct
 import json
 import logging
@@ -263,6 +264,64 @@ class FyersService:
                 "NSE:NIFTYMID100-INDEX": {"ltp": round(12800 + math.sin(t / 22) * 15, 2),                 "ch":  45.0,  "chp":  0.35},
             },
         }
+
+    # ------------------------------------------------------------------
+    # Historical candles
+    # ------------------------------------------------------------------
+
+    def get_history(self, symbol: str, days: int = 90, resolution: str = "D") -> dict:
+        """Returns live Fyers historical candles, or realistic mock candles."""
+        fyers_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
+
+        if self._client:
+            try:
+                to_ts   = int(time.time())
+                from_ts = to_ts - days * 86400
+                payload = {
+                    "symbol"     : fyers_symbol,
+                    "resolution" : resolution,
+                    "date_format": "0",
+                    "range_from" : str(from_ts),
+                    "range_to"   : str(to_ts),
+                    "cont_flag"  : "1",
+                }
+                resp = self._client.history(payload)
+                if resp.get("code") == 200 or resp.get("s") == "ok":
+                    raw = resp.get("candles", [])
+                    if raw:
+                        candles = [
+                            {"t": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]}
+                            for c in raw
+                        ]
+                        return {"success": True, "mock": False, "candles": candles}
+            except Exception as e:
+                logger.error(f"History error: {e}")
+
+        return self._mock_history(fyers_symbol, days)
+
+    def _mock_history(self, symbol: str, days: int) -> dict:
+        """Generate realistic mock daily candles (random walk) when live data unavailable."""
+        base    = BASE_PRICES.get(symbol, 24300.0)
+        price   = base * 0.90
+        candles: list = []
+        now     = int(time.time())
+
+        for i in range(days, -1, -1):
+            price  *= (1 + (random.random() - 0.49) * 0.015)
+            high    = price * (1 + random.random() * 0.008)
+            low     = price * (1 - random.random() * 0.008)
+            open_   = price * (1 + (random.random() - 0.5) * 0.005)
+            volume  = int(random.uniform(500000, 2000000))
+            candles.append({
+                "t"     : now - i * 86400,
+                "open"  : round(open_, 2),
+                "high"  : round(high,  2),
+                "low"   : round(low,   2),
+                "close" : round(price, 2),
+                "volume": volume,
+            })
+
+        return {"success": True, "mock": True, "candles": candles}
 
     # ------------------------------------------------------------------
     # Option Chain
