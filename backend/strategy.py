@@ -58,7 +58,7 @@ class StrategyEngine:
             sl          = sl,
             target      = target,
             risk_reward = rr,
-            max_profit  = float("inf"),
+            max_profit  = None,
             max_loss    = premium,
             breakeven   = [round(K + premium, 2)],
             legs        = [{"action": "BUY", "type": "CE", "strike": K, "premium": premium}],
@@ -105,7 +105,7 @@ class StrategyEngine:
             target      = target,
             risk_reward = rr,
             max_profit  = premium,
-            max_loss    = float("inf"),
+            max_loss    = None,
             breakeven   = [round(atm - premium, 2), round(atm + premium, 2)],
             legs        = [
                 {"action": "SELL", "type": "CE", "strike": atm, "premium": ce},
@@ -134,7 +134,7 @@ class StrategyEngine:
             target      = target,
             risk_reward = rr,
             max_profit  = premium,
-            max_loss    = float("inf"),
+            max_loss    = None,
             breakeven   = [round(pe_strike - premium, 2), round(ce_strike + premium, 2)],
             legs        = [
                 {"action": "SELL", "type": "CE", "strike": ce_strike, "premium": ce},
