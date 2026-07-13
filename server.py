@@ -548,3 +548,18 @@ if __name__ == "__main__":
     print(f"  Health : http://localhost:8000/api/health")
     print("=" * 50)
     app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
+
+# ─── AI Assistant Proxy (Claude → OpenAI → Gemini free fallback) ─────────
+
+from backend.ai_service import chat as ai_chat_fn
+
+@app.route("/api/ai/chat", methods=["POST"])
+def ai_chat():
+    payload       = request.json or {}
+    messages      = payload.get("messages", [])
+    system_prompt = payload.get("system", "")
+    provider      = payload.get("provider")
+    result = ai_chat_fn(messages, system_prompt, provider=provider)
+    if result.get("success"):
+        return jsonify({"success": True, "text": result["text"], "provider": result.get("provider")})
+    return jsonify({"success": False, "error": result.get("error", "AI request failed")}), 502
