@@ -540,15 +540,6 @@ def scheduler_status():
 # Main
 # ===========================================================================
 
-if __name__ == "__main__":
-    print("=" * 50)
-    print("  TradePro Backend v3.0")
-    print(f"  Mode   : {'LIVE' if _svc.token else 'MOCK'}")
-    print(f"  Server : http://localhost:8000")
-    print(f"  Health : http://localhost:8000/api/health")
-    print("=" * 50)
-    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
-
 # ─── AI Assistant Proxy (Claude → OpenAI → Gemini free fallback) ─────────
 
 from backend.ai_service import chat as ai_chat_fn
@@ -563,3 +554,12 @@ def ai_chat():
     if result.get("success"):
         return jsonify({"success": True, "text": result["text"], "provider": result.get("provider")})
     return jsonify({"success": False, "error": result.get("error", "AI request failed")}), 502
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("  TradePro Backend v3.0")
+    print(f"  Mode   : {'LIVE' if _svc.token else 'MOCK'}")
+    print(f"  Server : http://localhost:8000")
+    print(f"  Health : http://localhost:8000/api/health")
+    print("=" * 50)
+    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
