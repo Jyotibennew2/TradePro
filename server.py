@@ -21,6 +21,7 @@ from backend.error_handler  import register_error_handlers
 from backend.validators     import (
     validate_symbol, validate_expiry, validate_strike_count,
     validate_quantity, validate_price, validate_strategy, validate_days,
+    validate_resolution,
 )
 from backend.fyers_service      import FyersService
 from backend.services.market_data import MarketDataService
@@ -209,13 +210,14 @@ def funds():
 
 @app.route("/api/backtest", methods=["POST"])
 def backtest():
-    b        = request.json or {}
-    symbol   = b.get("symbol", "NIFTY")
-    strategy = b.get("strategy", "straddle")
-    days     = b.get("days", 90)
-    sl_pct   = float(b.get("sl_pct", 50))
-    tgt_pct  = float(b.get("tgt_pct", 50))
-    lot_size = int(b.get("lot_size", 50))
+    b          = request.json or {}
+    symbol     = b.get("symbol", "NIFTY")
+    strategy   = b.get("strategy", "straddle")
+    days       = b.get("days", 90)
+    resolution = b.get("resolution", "1d")
+    sl_pct     = float(b.get("sl_pct", 50))
+    tgt_pct    = float(b.get("tgt_pct", 50))
+    lot_size   = int(b.get("lot_size", 50))
 
     ok, msg = validate_symbol(symbol)
     if not ok:
@@ -226,14 +228,19 @@ def backtest():
     ok, msg = validate_days(days)
     if not ok:
         return error(msg, 400)
+    ok, msg = validate_resolution(resolution)
+    if not ok:
+        return error(msg, 400)
 
     days = int(days)
-    hist = _market.get_historical(symbol, days=days, interval="1D")
+    hist = _market.get_historical(symbol, days=days, interval=resolution)
     raw_candles = hist.get("candles", [])
     if not raw_candles:
         return error("No historical data available", 500)
     candles      = [{"c": c["close"], "t": c["t"]} for c in raw_candles]
     is_mock_data = bool(hist.get("mock", True))
+    is_intraday  = resolution != "1d"
+    date_fmt     = "%d %b %H:%M" if is_intraday else "%d %b"
 
     trades: list = []
     rpnl = peak  = 0.0
@@ -281,7 +288,7 @@ def backtest():
         peak  = max(peak, rpnl)
         mdd   = min(mdd, rpnl - peak)
         trades.append({
-            "date": datetime.fromtimestamp(day["t"]).strftime("%d %b"),
+            "date": datetime.fromtimestamp(day["t"]).strftime(date_fmt),
             "spot": round(S, 2), "iv": round(iv*100, 1),
             "prem": round(abs(prem), 2), "pnl": pnl, "win": pnl > 0,
         })
@@ -298,6 +305,7 @@ def backtest():
     return jsonify({
         "success"    : True,
         "symbol"     : symbol,
+        "resolution" : resolution,
         "data_source": "MOCK" if is_mock_data else "LIVE",
         "summary": {
             "total"        : tot,
@@ -528,12 +536,18 @@ def notification_test():
 
 @app.route("/api/historical")
 def historical():
-    symbol = request.args.get("symbol", "NIFTY")
-    days   = int(request.args.get("days", 30))
+    symbol     = request.args.get("symbol", "NIFTY")
+    days       = int(request.args.get("days", 30))
+    resolution = request.args.get("resolution", "1d")
+
     ok, msg = validate_symbol(symbol)
     if not ok:
         return error(msg, 400)
-    return jsonify(_market.get_historical(symbol, days))
+    ok, msg = validate_resolution(resolution)
+    if not ok:
+        return error(msg, 400)
+
+    return jsonify(_market.get_historical(symbol, days, interval=resolution))
 
 # ---------------------------------------------------------------------------
 # Scheduler status
