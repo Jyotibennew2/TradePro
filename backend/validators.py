@@ -15,6 +15,28 @@ VALID_STRATEGIES: set[str] = {"straddle", "strangle", "ironCondor", "longCall", 
 MIN_STRIKE_COUNT: int      = 1
 MAX_STRIKE_COUNT: int      = 20
 
+# Friendly resolution name -> Fyers API resolution code
+# https://myapi.fyers.in/docs  (resolution: "D" for daily, minutes as string otherwise)
+RESOLUTION_MAP: dict[str, str] = {
+    "5m" : "5",
+    "15m": "15",
+    "30m": "30",
+    "1h" : "60",
+    "2h" : "120",
+    "1d" : "D",
+}
+
+# Max lookback days per resolution — intraday history is heavier, so keep
+# smaller windows practical; daily can go a full year.
+MAX_DAYS_BY_RESOLUTION: dict[str, int] = {
+    "5m" : 30,
+    "15m": 60,
+    "30m": 90,
+    "1h" : 180,
+    "2h" : 270,
+    "1d" : 365,
+}
+
 
 # ---------------------------------------------------------------------------
 # Individual validators
@@ -102,3 +124,18 @@ def validate_days(value: Optional[any]) -> Tuple[bool, str]:
     if not (1 <= days <= 365):
         return False, "days must be between 1 and 365"
     return True, ""
+
+
+def validate_resolution(value: Optional[str]) -> Tuple[bool, str]:
+    """Validate historical-data timeframe (5m/15m/30m/1h/2h/1d)."""
+    if not value:
+        return True, ""   # optional — default "1d" used
+    if value not in RESOLUTION_MAP:
+        return False, f"resolution must be one of {sorted(RESOLUTION_MAP)}"
+    return True, ""
+
+
+def clamp_days_for_resolution(days: int, resolution: str) -> int:
+    """Cap requested days to a sane max for the given timeframe."""
+    cap = MAX_DAYS_BY_RESOLUTION.get(resolution, 365)
+    return min(days, cap)
