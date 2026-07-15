@@ -11,6 +11,7 @@ import logging
 from typing import Optional
 from backend.cache import quote_cache, chain_cache
 from backend.fyers_service import FyersService
+from backend.validators import RESOLUTION_MAP, clamp_days_for_resolution
 
 logger = logging.getLogger(__name__)
 
@@ -91,28 +92,35 @@ class MarketDataService:
     def get_historical(
         self,
         symbol    : str,
-        days      : int   = 30,
-        interval  : str   = "1D",
+        days      : int = 30,
+        interval  : str = "1d",
     ) -> dict:
         """
-        Return historical OHLCV candles.
+        Return historical OHLCV candles for a given timeframe.
+
+        interval accepts friendly names: "5m", "15m", "30m", "1h", "2h", "1d"
+        (legacy "1D"/"D" also accepted and treated as "1d").
         Delegates to FyersService.get_history() — returns real Fyers data
         when authenticated, realistic mock data otherwise.
         """
-        cache_key = f"hist:{symbol}:{days}:{interval}"
+        norm = interval.lower() if interval not in ("D", "1D") else "1d"
+        resolution = RESOLUTION_MAP.get(norm, "D")
+        days       = clamp_days_for_resolution(days, norm)
+
+        cache_key = f"hist:{symbol}:{days}:{norm}"
         cached    = chain_cache.get(cache_key)
         if cached:
             return cached
 
-        resolution = "D" if interval in ("1D", "D") else interval
-        hist       = self._svc.get_history(symbol, days=days, resolution=resolution)
+        hist = self._svc.get_history(symbol, days=days, resolution=resolution)
 
         result = {
-            "success" : hist.get("success", True),
-            "symbol"  : symbol,
-            "interval": interval,
-            "candles" : hist.get("candles", []),
-            "mock"    : hist.get("mock", True),
+            "success"   : hist.get("success", True),
+            "symbol"    : symbol,
+            "interval"  : norm,
+            "days_used" : days,
+            "candles"   : hist.get("candles", []),
+            "mock"      : hist.get("mock", True),
         }
         chain_cache.set(cache_key, result, ttl=300)
         return result
