@@ -14,7 +14,7 @@ from flask_cors import CORS
 
 from backend.logger         import setup_logging, get_logger
 from backend.config         import APP_ID, SECRET, REDIRECT_URL, validate, summary
-from backend.pricing        import bs
+from backend.pricing        import bs, BlackScholes
 from backend.response       import success, error
 from backend.middleware     import register_middleware
 from backend.error_handler  import register_error_handlers
@@ -164,6 +164,71 @@ def option_chain():
     return jsonify(_market.get_option_chain(
         symbol=symbol, expiry=expiry, strike_count=int(count)
     ))
+
+# ---------------------------------------------------------------------------
+# Historical Option Chain (reconstructed via Black-Scholes)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/optionchain/historical")
+def option_chain_historical():
+    """
+    Fyers (and most retail broker APIs) do not offer real historical
+    option-chain snapshots — expired option contracts simply aren't
+    queryable after expiry. Instead, this reconstructs a *theoretical*
+    chain for a given historical spot price using Black-Scholes, so a
+    trader can see what strikes/premiums would plausibly have looked
+    like on that day. Always returned with reconstructed=True so the
+    frontend can label it clearly (never confuse this with a real quote).
+    """
+    try:
+        symbol         = request.args.get("symbol", "NIFTY")
+        spot           = float(request.args.get("spot", 0))
+        iv             = float(request.args.get("iv", 15)) / 100
+        days_to_expiry = float(request.args.get("days_to_expiry", 7))
+        strike_count   = int(request.args.get("strikecount", 10))
+        rate           = float(request.args.get("rate", 6.5)) / 100
+        label          = request.args.get("label", "")
+
+        ok, msg = validate_symbol(symbol)
+        if not ok:
+            return error(msg, 400)
+        if spot <= 0:
+            return error("spot must be a positive number", 400)
+        if not (1 <= strike_count <= 20):
+            return error("strikecount must be between 1 and 20", 400)
+
+        T    = max(days_to_expiry, 0.5) / 365
+        step = 100 if spot < 30000 else 200
+        atm  = round(spot / step) * step
+
+        rows = []
+        for i in range(-strike_count, strike_count + 1):
+            K  = atm + i * step
+            ce = BlackScholes(spot, K, T, rate, iv, "call")
+            pe = BlackScholes(spot, K, T, rate, iv, "put")
+            rows.append({
+                "strike"  : K,
+                "ce_ltp"  : round(ce.price(), 2),
+                "pe_ltp"  : round(pe.price(), 2),
+                "ce_iv"   : round(iv * 100, 1),
+                "pe_iv"   : round(iv * 100, 1),
+                "ce_delta": round(ce.delta(), 3),
+                "pe_delta": round(pe.delta(), 3),
+                "atm"     : K == atm,
+            })
+
+        return jsonify({
+            "success"       : True,
+            "symbol"        : symbol,
+            "spot"          : spot,
+            "label"         : label,
+            "reconstructed" : True,
+            "note"          : "Reconstructed via Black-Scholes from historical spot — not a real historical quote",
+            "data"          : {"expiryData": rows, "atmIndex": strike_count},
+        })
+    except Exception as e:
+        logger.error(f"Historical option chain error: {e}")
+        return error(str(e), 400)
 
 # ---------------------------------------------------------------------------
 # Positions
