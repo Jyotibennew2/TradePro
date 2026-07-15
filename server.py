@@ -210,12 +210,16 @@ def funds():
 @app.route("/api/backtest", methods=["POST"])
 def backtest():
     b        = request.json or {}
+    symbol   = b.get("symbol", "NIFTY")
     strategy = b.get("strategy", "straddle")
     days     = b.get("days", 90)
     sl_pct   = float(b.get("sl_pct", 50))
     tgt_pct  = float(b.get("tgt_pct", 50))
     lot_size = int(b.get("lot_size", 50))
 
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
     ok, msg = validate_strategy(strategy)
     if not ok:
         return error(msg, 400)
@@ -224,11 +228,12 @@ def backtest():
         return error(msg, 400)
 
     days = int(days)
-    hist = _market.get_historical("NIFTY", days=days, interval="1D")
+    hist = _market.get_historical(symbol, days=days, interval="1D")
     raw_candles = hist.get("candles", [])
     if not raw_candles:
         return error("No historical data available", 500)
-    candles = [{"c": c["close"], "t": c["t"]} for c in raw_candles]
+    candles      = [{"c": c["close"], "t": c["t"]} for c in raw_candles]
+    is_mock_data = bool(hist.get("mock", True))
 
     trades: list = []
     rpnl = peak  = 0.0
@@ -291,7 +296,9 @@ def backtest():
         equity.append({"date": t["date"], "equity": round(eq, 2)})
 
     return jsonify({
-        "success": True,
+        "success"    : True,
+        "symbol"     : symbol,
+        "data_source": "MOCK" if is_mock_data else "LIVE",
         "summary": {
             "total"        : tot,
             "wins"         : len(wins),
