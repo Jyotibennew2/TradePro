@@ -251,7 +251,8 @@ def option_chain_archive():
     Returns REAL saved option-chain snapshots for a given date, if TradePro
     was running and archiving that day. Unlike /historical (which is a
     Black-Scholes reconstruction), this is genuine live data that was
-    captured and stored — no dependency on NSE bhavcopy or estimation.
+    captured and stored — including IV and Greeks (delta/gamma/theta/vega)
+    that were backed out from the real traded LTP at save time.
     """
     try:
         symbol = request.args.get("symbol", "NIFTY")
@@ -269,23 +270,34 @@ def option_chain_archive():
 
         rows = [{
             "strike"  : r["strike"],
-            "ce_ltp"  : r["ce_ltp"],
-            "pe_ltp"  : r["pe_ltp"],
+            "ce_ltp"  : r.get("ce_ltp"),
+            "pe_ltp"  : r.get("pe_ltp"),
             "ce_oi"   : r.get("ce_oi"),
             "pe_oi"   : r.get("pe_oi"),
+            "ce_iv"   : r.get("ce_iv"),
+            "pe_iv"   : r.get("pe_iv"),
+            "ce_delta": r.get("ce_delta"),
+            "pe_delta": r.get("pe_delta"),
+            "ce_gamma": r.get("ce_gamma"),
+            "pe_gamma": r.get("pe_gamma"),
+            "ce_theta": r.get("ce_theta"),
+            "pe_theta": r.get("pe_theta"),
+            "ce_vega" : r.get("ce_vega"),
+            "pe_vega" : r.get("pe_vega"),
             "atm"     : r.get("atm", False),
         } for r in snapshot["rows"]]
 
         return jsonify({
-            "success"      : True,
-            "symbol"       : symbol,
-            "date"         : date,
-            "spot"         : snapshot["spot"],
-            "saved_at"     : snapshot["t"],
-            "reconstructed": False,
-            "was_mock"     : snapshot.get("mock", False),
-            "note"         : "Real data captured and saved by TradePro on this date",
-            "data"         : {"expiryData": rows, "atmIndex": len(rows) // 2},
+            "success"             : True,
+            "symbol"              : symbol,
+            "date"                : date,
+            "spot"                : snapshot["spot"],
+            "saved_at"            : snapshot["t"],
+            "reconstructed"       : False,
+            "was_mock"            : snapshot.get("mock", False),
+            "days_to_expiry_used" : snapshot.get("days_to_expiry_used"),
+            "note"                : "Real data captured and saved by TradePro on this date. IV/Greeks are backed out from the real LTP using an assumed days-to-expiry (see days_to_expiry_used).",
+            "data"                : {"expiryData": rows, "atmIndex": len(rows) // 2},
         })
     except Exception as e:
         logger.error(f"Option chain archive error: {e}")
