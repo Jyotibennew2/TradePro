@@ -25,6 +25,7 @@ from backend.validators     import (
 )
 from backend.fyers_service      import FyersService
 from backend.services.market_data import MarketDataService
+from backend.services            import chain_archive
 from backend.greeks             import GreeksEngine
 from backend.strategy           import StrategyEngine
 from backend.scanner            import ScannerEngine
@@ -68,9 +69,19 @@ register_error_handlers(app)
 # Scheduler tasks
 # ---------------------------------------------------------------------------
 
+def _archive_chains():
+    """Every 5 min during market hours, save real option-chain snapshots to disk."""
+    for sym in ("NIFTY", "BANKNIFTY"):
+        try:
+            result = _market.get_option_chain(symbol=sym)
+            chain_archive.save_snapshot(sym, result)
+        except Exception as e:
+            logger.warning(f"Archive snapshot failed for {sym}: {e}")
+
 scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=3)
 scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=10)
 scheduler.add_task("cache_cleanup",   lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
+scheduler.add_task("archive_chains",  _archive_chains,                      interval=300)
 scheduler.start()
 
 # ===========================================================================
@@ -229,6 +240,66 @@ def option_chain_historical():
     except Exception as e:
         logger.error(f"Historical option chain error: {e}")
         return error(str(e), 400)
+
+# ---------------------------------------------------------------------------
+# Real Archived Option Chain (saved automatically every ~5 min during market hours)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/optionchain/archive")
+def option_chain_archive():
+    """
+    Returns REAL saved option-chain snapshots for a given date, if TradePro
+    was running and archiving that day. Unlike /historical (which is a
+    Black-Scholes reconstruction), this is genuine live data that was
+    captured and stored — no dependency on NSE bhavcopy or estimation.
+    """
+    try:
+        symbol = request.args.get("symbol", "NIFTY")
+        date   = request.args.get("date", "")   # YYYY-MM-DD
+
+        ok, msg = validate_symbol(symbol)
+        if not ok:
+            return error(msg, 400)
+        if not date:
+            return error("date (YYYY-MM-DD) is required", 400)
+
+        snapshot = chain_archive.nearest_snapshot(symbol, date)
+        if not snapshot:
+            return error(f"No archived data saved for {symbol} on {date}", 404)
+
+        rows = [{
+            "strike"  : r["strike"],
+            "ce_ltp"  : r["ce_ltp"],
+            "pe_ltp"  : r["pe_ltp"],
+            "ce_oi"   : r.get("ce_oi"),
+            "pe_oi"   : r.get("pe_oi"),
+            "atm"     : r.get("atm", False),
+        } for r in snapshot["rows"]]
+
+        return jsonify({
+            "success"      : True,
+            "symbol"       : symbol,
+            "date"         : date,
+            "spot"         : snapshot["spot"],
+            "saved_at"     : snapshot["t"],
+            "reconstructed": False,
+            "was_mock"     : snapshot.get("mock", False),
+            "note"         : "Real data captured and saved by TradePro on this date",
+            "data"         : {"expiryData": rows, "atmIndex": len(rows) // 2},
+        })
+    except Exception as e:
+        logger.error(f"Option chain archive error: {e}")
+        return error(str(e), 400)
+
+
+@app.route("/api/optionchain/archive/dates")
+def option_chain_archive_dates():
+    """Returns list of dates that have at least one real saved snapshot."""
+    symbol = request.args.get("symbol", "NIFTY")
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    return jsonify({"success": True, "symbol": symbol, "dates": chain_archive.list_available_dates(symbol)})
 
 # ---------------------------------------------------------------------------
 # Positions
