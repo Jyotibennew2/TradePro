@@ -123,12 +123,19 @@ class GreeksEngine:
         r            : Risk-free rate
         sigma        : Volatility (used if market_price not provided)
         option_type  : 'call' or 'put'
-        market_price : If provided, IV is calculated from this price
+        market_price : If provided, IV is solved from this price and used
+                        for ALL Greeks below (not the `sigma` guess) — so
+                        Delta/Gamma/Theta/Vega stay consistent with the IV
+                        actually implied by the real traded price.
         """
         try:
-            bs  = BlackScholes(S, K, T, r, sigma, option_type)
-            iv  = calculate_iv(market_price, S, K, T, r, option_type) if market_price else sigma
-            rho = _rho(S, K, T, r, sigma, option_type)
+            iv_decimal = calculate_iv(market_price, S, K, T, r, option_type) if market_price else sigma
+            # Guard against a failed/zero solve — fall back to the sigma guess
+            # rather than pricing Greeks off a meaningless 0 vol.
+            effective_sigma = iv_decimal if iv_decimal > 0 else sigma
+
+            bs  = BlackScholes(S, K, T, r, effective_sigma, option_type)
+            rho = _rho(S, K, T, r, effective_sigma, option_type)
 
             return Greeks(
                 delta = round(bs.delta(), 6),
@@ -136,7 +143,7 @@ class GreeksEngine:
                 theta = round(bs.theta(), 6),
                 vega  = round(bs.vega(),  6),
                 rho   = round(rho,        6),
-                iv    = round(iv * 100,   4),   # return as percentage
+                iv    = round(effective_sigma * 100, 4),   # return as percentage
                 price = round(bs.price(), 2),
             )
         except Exception as e:
