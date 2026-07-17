@@ -73,7 +73,7 @@ def _archive_chains():
     """Every 5 min during market hours, save real option-chain snapshots to disk."""
     for sym in ("NIFTY", "BANKNIFTY"):
         try:
-            result = _market.get_option_chain(symbol=sym)
+            result = _market.get_option_chain(symbol=sym, strike_count=20)
             chain_archive.save_snapshot(sym, result)
         except Exception as e:
             logger.warning(f"Archive snapshot failed for {sym}: {e}")
