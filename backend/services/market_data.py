@@ -12,8 +12,12 @@ from typing import Optional
 from backend.cache import quote_cache, chain_cache
 from backend.fyers_service import FyersService
 from backend.validators import RESOLUTION_MAP, clamp_days_for_resolution
+from backend.greeks import GreeksEngine
 
 logger = logging.getLogger(__name__)
+
+RISK_FREE_RATE          = 0.065
+DEFAULT_DAYS_TO_EXPIRY  = 7   # weekly index options — used only when the feed doesn't tell us the real expiry
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +78,70 @@ class MarketDataService:
         symbol      : str = "NIFTY",
         expiry      : str = "",
         strike_count: int = 10,
+        days_to_expiry: Optional[float] = None,
     ) -> dict:
-        """Return option chain with cache (10s TTL)."""
+        """Return option chain (with IV + Greeks enriched) with cache (10s TTL)."""
         cache_key = f"chain:{symbol}:{expiry}:{strike_count}"
         cached    = chain_cache.get(cache_key)
         if cached:
             return cached
         result = self._svc.get_option_chain(symbol=symbol, expiry=expiry, strike_count=strike_count)
         if result.get("success"):
+            self._enrich_with_greeks(result, days_to_expiry or DEFAULT_DAYS_TO_EXPIRY)
             chain_cache.set(cache_key, result)
         return result
+
+    def _enrich_with_greeks(self, chain_result: dict, days_to_expiry: float) -> None:
+        """
+        Mutates chain_result in place, adding iv/delta/gamma/theta/vega to
+        every CE/PE entry — backed out from the real traded LTP. Handles
+        both response shapes:
+          - mock/reconstructed: data.expiryData = [{strike, ce_ltp, pe_ltp, ...}]
+          - live Fyers         : data.optionsChain = [{strike_price, option_type, ltp, ...}]
+        """
+        try:
+            data = chain_result.get("data", {})
+            T    = max(days_to_expiry, 0.5) / 365
+
+            # Mock / reconstructed shape — already strike-keyed rows
+            expiry_data = data.get("expiryData")
+            if expiry_data and isinstance(expiry_data, list) and expiry_data and "strike" in expiry_data[0]:
+                spot = chain_result.get("spot", 0) or 0
+                if not spot:
+                    return
+                for row in expiry_data:
+                    strike = row.get("strike")
+                    if strike is None:
+                        continue
+                    if row.get("ce_ltp"):
+                        g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "call", market_price=row["ce_ltp"])
+                        row["ce_iv"], row["ce_delta"], row["ce_gamma"], row["ce_theta"], row["ce_vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
+                    if row.get("pe_ltp"):
+                        g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "put", market_price=row["pe_ltp"])
+                        row["pe_iv"], row["pe_delta"], row["pe_gamma"], row["pe_theta"], row["pe_vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
+                return
+
+            # Live Fyers shape — flat list, one row per contract, spot carried on the "" option_type row
+            options_chain = data.get("optionsChain")
+            if options_chain and isinstance(options_chain, list):
+                spot = 0.0
+                for item in options_chain:
+                    if item.get("option_type", "") == "":
+                        spot = item.get("ltp", 0) or spot
+                        break
+                if not spot:
+                    return
+                otype_map = {"CE": "call", "PE": "put"}
+                for item in options_chain:
+                    otype = otype_map.get(item.get("option_type"))
+                    strike = item.get("strike_price")
+                    ltp    = item.get("ltp")
+                    if not otype or strike is None or not ltp:
+                        continue
+                    g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, otype, market_price=ltp)
+                    item["iv"], item["delta"], item["gamma"], item["theta"], item["vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
+        except Exception as e:
+            logger.warning(f"Greeks enrichment failed: {e}")
 
     # ------------------------------------------------------------------
     # Historical candles
