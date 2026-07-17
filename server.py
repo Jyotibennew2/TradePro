@@ -187,9 +187,9 @@ def option_chain_historical():
     option-chain snapshots — expired option contracts simply aren't
     queryable after expiry. Instead, this reconstructs a *theoretical*
     chain for a given historical spot price using Black-Scholes, so a
-    trader can see what strikes/premiums would plausibly have looked
-    like on that day. Always returned with reconstructed=True so the
-    frontend can label it clearly (never confuse this with a real quote).
+    trader can see what strikes/premiums/Greeks would plausibly have
+    looked like on that day. Always returned with reconstructed=True so
+    the frontend can label it clearly (never confuse this with a real quote).
     """
     try:
         symbol         = request.args.get("symbol", "NIFTY")
@@ -225,6 +225,12 @@ def option_chain_historical():
                 "pe_iv"   : round(iv * 100, 1),
                 "ce_delta": round(ce.delta(), 3),
                 "pe_delta": round(pe.delta(), 3),
+                "ce_gamma": round(ce.gamma(), 5),
+                "pe_gamma": round(pe.gamma(), 5),
+                "ce_theta": round(ce.theta(), 2),
+                "pe_theta": round(pe.theta(), 2),
+                "ce_vega" : round(ce.vega(),  2),
+                "pe_vega" : round(pe.vega(),  2),
                 "atm"     : K == atm,
             })
 
