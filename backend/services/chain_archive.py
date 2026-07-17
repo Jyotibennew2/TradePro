@@ -4,10 +4,9 @@ Saves real (live) option-chain snapshots to disk every few minutes so that,
 over time, TradePro builds its own genuine historical option-chain database —
 no dependency on NSE's fragile/changing bhavcopy format.
 
-Also computes and stores IV + Greeks (delta/gamma/theta/vega) for every
-saved strike, backed out from the real traded LTP via the existing
-Black-Scholes/IV-solver engine — so archived snapshots are immediately
-usable for Greeks-aware backtesting later, not just raw LTP/OI.
+IV + Greeks (delta/gamma/theta/vega) are already computed upstream by
+MarketDataService.get_option_chain() before this module ever sees the data
+— this module just persists whatever it's handed.
 
 Storage layout (JSON Lines, one snapshot per line, easy to append + stream):
     data/archive/<SYMBOL>/<YYYY-MM-DD>.jsonl
@@ -32,8 +31,6 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 
-from backend.greeks import GreeksEngine
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -45,11 +42,7 @@ ARCHIVE_ROOT = os.path.abspath(ARCHIVE_ROOT)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Assumed time-to-expiry for Greeks/IV back-out when the live feed doesn't
-# tell us the exact contract expiry. Nifty/BankNifty weekly options are the
-# most heavily traded, so 7 calendar days is a reasonable default.
-DEFAULT_DAYS_TO_EXPIRY = 7
-RISK_FREE_RATE         = 0.065
+DEFAULT_DAYS_TO_EXPIRY = 7   # kept here for reference in the response payload
 
 
 def _symbol_dir(symbol: str) -> str:
@@ -77,28 +70,29 @@ def _within_market_hours() -> bool:
 
 # ---------------------------------------------------------------------------
 # Normalize whichever chain shape we were given into strike-keyed CE/PE data
+# (IV/Greeks, if present, are carried straight through — they were already
+# computed by MarketDataService before this snapshot was passed in)
 # ---------------------------------------------------------------------------
 
+_GREEK_FIELDS = ("iv", "delta", "gamma", "theta", "vega")
+
+
 def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
-    """
-    MarketDataService.get_option_chain() can return two different shapes:
-      - mock/reconstructed : data.expiryData = [{strike, ce_ltp, pe_ltp, ce_oi, pe_oi, atm}, ...]
-      - live Fyers          : data.optionsChain = [{strike_price, option_type, ltp, oi}, ...]
-                               (plus one row with option_type "" carrying the spot LTP)
-    Returns (rows, spot) in the normalized {strike, ce_ltp, pe_ltp, ce_oi, pe_oi} shape.
-    """
     data = chain_result.get("data", {})
 
-    if data.get("expiryData") and isinstance(data["expiryData"], list) and data["expiryData"] and "strike" in data["expiryData"][0]:
-        rows = [{
-            "strike": r.get("strike"),
-            "ce_ltp": r.get("ce_ltp"),
-            "pe_ltp": r.get("pe_ltp"),
-            "ce_oi" : r.get("ce_oi"),
-            "pe_oi" : r.get("pe_oi"),
-        } for r in data["expiryData"]]
-        spot = chain_result.get("spot", 0) or 0
-        return rows, spot
+    expiry_data = data.get("expiryData")
+    if expiry_data and isinstance(expiry_data, list) and expiry_data and "strike" in expiry_data[0]:
+        rows = []
+        for r in expiry_data:
+            row = {"strike": r.get("strike"), "ce_ltp": r.get("ce_ltp"), "pe_ltp": r.get("pe_ltp"),
+                   "ce_oi": r.get("ce_oi"), "pe_oi": r.get("pe_oi")}
+            for f in _GREEK_FIELDS:
+                if r.get(f"ce_{f}") is not None:
+                    row[f"ce_{f}"] = r[f"ce_{f}"]
+                if r.get(f"pe_{f}") is not None:
+                    row[f"pe_{f}"] = r[f"pe_{f}"]
+            rows.append(row)
+        return rows, chain_result.get("spot", 0) or 0
 
     options_chain = data.get("optionsChain", [])
     if options_chain:
@@ -116,13 +110,17 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
             target[strike] = item
 
         strikes = sorted(set(list(ce_map.keys()) + list(pe_map.keys())))
-        rows = [{
-            "strike": k,
-            "ce_ltp": ce_map.get(k, {}).get("ltp"),
-            "pe_ltp": pe_map.get(k, {}).get("ltp"),
-            "ce_oi" : ce_map.get(k, {}).get("oi"),
-            "pe_oi" : pe_map.get(k, {}).get("oi"),
-        } for k in strikes]
+        rows = []
+        for k in strikes:
+            ce, pe = ce_map.get(k, {}), pe_map.get(k, {})
+            row = {"strike": k, "ce_ltp": ce.get("ltp"), "pe_ltp": pe.get("ltp"),
+                   "ce_oi": ce.get("oi"), "pe_oi": pe.get("oi")}
+            for f in _GREEK_FIELDS:
+                if ce.get(f) is not None:
+                    row[f"ce_{f}"] = ce[f]
+                if pe.get(f) is not None:
+                    row[f"pe_{f}"] = pe[f]
+            rows.append(row)
         return rows, spot
 
     return [], 0.0
@@ -135,7 +133,6 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
 def save_snapshot(symbol: str, chain_result: dict) -> bool:
     """
     Save one option-chain snapshot for `symbol` if the market is open.
-    Backs out IV + Greeks for each strike from the real LTP.
     Returns True if a snapshot was written.
     """
     try:
@@ -148,39 +145,16 @@ def save_snapshot(symbol: str, chain_result: dict) -> bool:
 
         step = 100 if spot < 30000 else 200
         atm  = round(spot / step) * step
-        T    = DEFAULT_DAYS_TO_EXPIRY / 365
 
-        enriched = []
-        for r in rows:
-            strike = r["strike"]
-            if strike is None:
-                continue
-
-            row = {
-                "strike": strike,
-                "ce_ltp": r.get("ce_ltp"),
-                "pe_ltp": r.get("pe_ltp"),
-                "ce_oi" : r.get("ce_oi"),
-                "pe_oi" : r.get("pe_oi"),
-                "atm"   : strike == atm,
-            }
-
-            if r.get("ce_ltp"):
-                g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "call", market_price=r["ce_ltp"])
-                row.update({"ce_iv": g.iv, "ce_delta": g.delta, "ce_gamma": g.gamma, "ce_theta": g.theta, "ce_vega": g.vega})
-
-            if r.get("pe_ltp"):
-                g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "put", market_price=r["pe_ltp"])
-                row.update({"pe_iv": g.iv, "pe_delta": g.delta, "pe_gamma": g.gamma, "pe_theta": g.theta, "pe_vega": g.vega})
-
-            enriched.append(row)
+        for row in rows:
+            row["atm"] = row.get("strike") == atm
 
         snapshot = {
-            "t"                : int(time.time()),
-            "spot"              : spot,
-            "mock"              : bool(chain_result.get("mock", True)),
+            "t"                  : int(time.time()),
+            "spot"               : spot,
+            "mock"               : bool(chain_result.get("mock", True)),
             "days_to_expiry_used": DEFAULT_DAYS_TO_EXPIRY,
-            "rows"              : enriched,
+            "rows"               : rows,
         }
 
         path = _file_for(symbol, _today_str())
