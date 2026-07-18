@@ -70,11 +70,18 @@ register_error_handlers(app)
 # ---------------------------------------------------------------------------
 
 def _archive_chains():
-    """Every 5 min during market hours, save real option-chain snapshots to disk."""
+    """
+    Every 5 min during market hours, save real option-chain snapshots to disk
+    — for EVERY available expiry (weekly, next-weekly, monthly, ...) not just
+    whichever one happens to be "nearest".
+    """
     for sym in ("NIFTY", "BANKNIFTY"):
         try:
-            result = _market.get_option_chain(symbol=sym, strike_count=20)
-            chain_archive.save_snapshot(sym, result)
+            expiries = _market.get_expiries(sym).get("expiries", [])
+            for exp in expiries:
+                expiry_date = chain_archive.parse_expiry_to_date(exp.get("expiry", ""))
+                result = _market.get_option_chain(symbol=sym, expiry=exp.get("expiry", ""), strike_count=20)
+                chain_archive.save_snapshot(sym, expiry_date, result)
         except Exception as e:
             logger.warning(f"Archive snapshot failed for {sym}: {e}")
 
@@ -177,6 +184,18 @@ def option_chain():
     ))
 
 # ---------------------------------------------------------------------------
+# Available expiries (for the option-chain expiry picker)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/optionchain/expiries")
+def option_chain_expiries():
+    symbol = request.args.get("symbol", "NIFTY")
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    return jsonify(_market.get_expiries(symbol))
+
+# ---------------------------------------------------------------------------
 # Historical Option Chain (reconstructed via Black-Scholes)
 # ---------------------------------------------------------------------------
 
@@ -249,20 +268,27 @@ def option_chain_historical():
 
 # ---------------------------------------------------------------------------
 # Real Archived Option Chain (saved automatically every ~5 min during market hours)
+# Each expiry (weekly / next-weekly / monthly) is archived separately.
 # ---------------------------------------------------------------------------
 
 @app.route("/api/optionchain/archive")
 def option_chain_archive():
     """
-    Returns REAL saved option-chain snapshots for a given date, if TradePro
-    was running and archiving that day. Unlike /historical (which is a
-    Black-Scholes reconstruction), this is genuine live data that was
-    captured and stored — including IV and Greeks (delta/gamma/theta/vega)
-    that were backed out from the real traded LTP at save time.
+    Returns REAL saved option-chain snapshots for a given capture date and
+    expiry. Unlike /historical (which is a Black-Scholes reconstruction),
+    this is genuine live data that was captured and stored — including IV
+    and Greeks backed out from the real traded LTP at save time.
+
+    Query params:
+      symbol  - NIFTY / BANKNIFTY
+      date    - capture date, YYYY-MM-DD (required)
+      expiry  - contract expiry date, YYYY-MM-DD (optional — defaults to
+                the nearest expiry that has data for this capture date)
     """
     try:
         symbol = request.args.get("symbol", "NIFTY")
-        date   = request.args.get("date", "")   # YYYY-MM-DD
+        date   = request.args.get("date", "")     # capture date YYYY-MM-DD
+        expiry = request.args.get("expiry", "")   # contract expiry YYYY-MM-DD
 
         ok, msg = validate_symbol(symbol)
         if not ok:
@@ -270,9 +296,15 @@ def option_chain_archive():
         if not date:
             return error("date (YYYY-MM-DD) is required", 400)
 
-        snapshot = chain_archive.nearest_snapshot(symbol, date)
+        if not expiry:
+            available = chain_archive.list_expiries_for_capture_date(symbol, date)
+            if not available:
+                return error(f"No archived data saved for {symbol} on {date}", 404)
+            expiry = available[0]   # nearest (folders are sorted ascending)
+
+        snapshot = chain_archive.nearest_snapshot(symbol, expiry, date)
         if not snapshot:
-            return error(f"No archived data saved for {symbol} on {date}", 404)
+            return error(f"No archived data saved for {symbol} expiry {expiry} on {date}", 404)
 
         rows = [{
             "strike"  : r["strike"],
@@ -297,12 +329,13 @@ def option_chain_archive():
             "success"             : True,
             "symbol"              : symbol,
             "date"                : date,
+            "expiry"              : expiry,
             "spot"                : snapshot["spot"],
             "saved_at"            : snapshot["t"],
             "reconstructed"       : False,
             "was_mock"            : snapshot.get("mock", False),
             "days_to_expiry_used" : snapshot.get("days_to_expiry_used"),
-            "note"                : "Real data captured and saved by TradePro on this date. IV/Greeks are backed out from the real LTP using an assumed days-to-expiry (see days_to_expiry_used).",
+            "note"                : "Real data captured and saved by TradePro for this specific expiry contract.",
             "data"                : {"expiryData": rows, "atmIndex": len(rows) // 2},
         })
     except Exception as e:
@@ -312,12 +345,39 @@ def option_chain_archive():
 
 @app.route("/api/optionchain/archive/dates")
 def option_chain_archive_dates():
-    """Returns list of dates that have at least one real saved snapshot."""
+    """
+    Returns list of capture dates that have at least one real saved snapshot.
+    Pass `expiry` (YYYY-MM-DD) to restrict to that specific expiry contract;
+    omit it to get the union across all archived expiries.
+    """
     symbol = request.args.get("symbol", "NIFTY")
+    expiry = request.args.get("expiry", "") or None
     ok, msg = validate_symbol(symbol)
     if not ok:
         return error(msg, 400)
-    return jsonify({"success": True, "symbol": symbol, "dates": chain_archive.list_available_dates(symbol)})
+    return jsonify({
+        "success": True, "symbol": symbol, "expiry": expiry,
+        "dates"  : chain_archive.list_available_dates(symbol, expiry),
+    })
+
+
+@app.route("/api/optionchain/archive/expiries")
+def option_chain_archive_expiries():
+    """
+    Returns all expiry contracts that have ever been archived for this
+    symbol (exp_YYYY-MM-DD folders). Pass `date` (capture date, YYYY-MM-DD)
+    to instead get only the expiries that have a snapshot for that specific day.
+    """
+    symbol = request.args.get("symbol", "NIFTY")
+    date   = request.args.get("date", "")
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    if date:
+        expiries = chain_archive.list_expiries_for_capture_date(symbol, date)
+    else:
+        expiries = chain_archive.list_expiries(symbol)
+    return jsonify({"success": True, "symbol": symbol, "date": date or None, "expiries": expiries})
 
 # ---------------------------------------------------------------------------
 # Positions
