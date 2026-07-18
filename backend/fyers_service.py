@@ -16,6 +16,7 @@ import logging
 import urllib.request
 import urllib.parse
 import urllib.error
+from datetime import datetime, timedelta
 from typing import Optional
 
 from backend.config import APP_ID, SECRET, TOKEN, REDIRECT_URL
@@ -338,6 +339,48 @@ class FyersService:
             })
 
         return {"success": True, "mock": True, "candles": candles}
+
+    # ------------------------------------------------------------------
+    # Available expiries
+    # ------------------------------------------------------------------
+
+    def get_expiries(self, symbol: str) -> dict:
+        """
+        Returns the list of available expiry dates for a symbol's option chain
+        (both weekly and monthly contracts, as offered by Fyers). Each item:
+        {"expiry": "<unix timestamp string>", "date": "DD-MM-YYYY"}.
+        """
+        fyers_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
+
+        if self._client:
+            try:
+                payload = {"symbol": fyers_symbol, "strikecount": 1, "timestamp": ""}
+                resp = self._client.optionchain(payload)
+                if resp.get("code") == 200 or resp.get("s") == "ok":
+                    expiry_data = resp.get("data", {}).get("expiryData", [])
+                    if expiry_data and "strike" not in expiry_data[0]:
+                        return {"success": True, "mock": False, "expiries": expiry_data}
+            except Exception as e:
+                logger.error(f"Expiries error: {e}")
+
+        return self._mock_expiries()
+
+    def _mock_expiries(self) -> dict:
+        """Synthetic expiry list — next 4 Thursdays (NSE index-option weekly cycle)."""
+        now = datetime.now()
+        days_ahead = (3 - now.weekday()) % 7   # Thursday == 3
+        if days_ahead == 0 and now.hour >= 15:
+            days_ahead = 7
+        first = now + timedelta(days=days_ahead)
+
+        expiries = []
+        for i in range(4):
+            d = first + timedelta(weeks=i)
+            expiries.append({
+                "date"  : d.strftime("%d-%m-%Y"),
+                "expiry": str(int(d.replace(hour=15, minute=30, second=0, microsecond=0).timestamp())),
+            })
+        return {"success": True, "mock": True, "expiries": expiries}
 
     # ------------------------------------------------------------------
     # Option Chain
