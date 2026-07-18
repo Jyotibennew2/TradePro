@@ -70,6 +70,21 @@ class MarketDataService:
         }
 
     # ------------------------------------------------------------------
+    # Expiries
+    # ------------------------------------------------------------------
+
+    def get_expiries(self, symbol: str) -> dict:
+        """Return the list of available option expiries (weekly + monthly), cached 5 min."""
+        cache_key = f"expiries:{symbol}"
+        cached    = chain_cache.get(cache_key)
+        if cached:
+            return cached
+        result = self._svc.get_expiries(symbol)
+        if result.get("success"):
+            chain_cache.set(cache_key, result, ttl=300)
+        return result
+
+    # ------------------------------------------------------------------
     # Option Chain
     # ------------------------------------------------------------------
 
