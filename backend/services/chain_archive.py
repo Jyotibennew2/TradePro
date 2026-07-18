@@ -4,12 +4,16 @@ Saves real (live) option-chain snapshots to disk every few minutes so that,
 over time, TradePro builds its own genuine historical option-chain database —
 no dependency on NSE's fragile/changing bhavcopy format.
 
+Each contract EXPIRY is archived separately (weekly, next-weekly, monthly, ...)
+so a user can later pick a specific expiry's chain, not just "whatever was
+nearest at capture time".
+
 IV + Greeks (delta/gamma/theta/vega) are already computed upstream by
 MarketDataService.get_option_chain() before this module ever sees the data
 — this module just persists whatever it's handed.
 
 Storage layout (JSON Lines, one snapshot per line, easy to append + stream):
-    data/archive/<SYMBOL>/<YYYY-MM-DD>.jsonl
+    data/archive/<SYMBOL>/exp_<EXPIRY_DATE YYYY-MM-DD>/<CAPTURE_DATE YYYY-MM-DD>.jsonl
 
 Each line:
     {"t": 1752999999, "spot": 24312.5, "mock": false,
@@ -45,6 +49,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_DAYS_TO_EXPIRY = 7   # kept here for reference in the response payload
 
 
+def _expiry_dir(symbol: str, expiry_date: str) -> str:
+    d = os.path.join(ARCHIVE_ROOT, symbol.upper(), f"exp_{expiry_date}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _symbol_dir(symbol: str) -> str:
     d = os.path.join(ARCHIVE_ROOT, symbol.upper())
     os.makedirs(d, exist_ok=True)
@@ -55,8 +65,8 @@ def _today_str() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
-def _file_for(symbol: str, date_str: str) -> str:
-    return os.path.join(_symbol_dir(symbol), f"{date_str}.jsonl")
+def _file_for(symbol: str, expiry_date: str, capture_date: str) -> str:
+    return os.path.join(_expiry_dir(symbol, expiry_date), f"{capture_date}.jsonl")
 
 
 def _within_market_hours() -> bool:
@@ -66,6 +76,21 @@ def _within_market_hours() -> bool:
         return False
     minutes = now.hour * 60 + now.minute
     return (9 * 60 + 15) <= minutes <= (15 * 60 + 30)
+
+
+def parse_expiry_to_date(expiry_raw: str) -> str:
+    """
+    Convert a Fyers expiry value (unix timestamp string, or DD-MM-YYYY date
+    string) to a normalized YYYY-MM-DD used as the folder name.
+    """
+    try:
+        return datetime.fromtimestamp(int(expiry_raw), IST).strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.strptime(expiry_raw, "%d-%m-%Y").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return expiry_raw
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +155,11 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
 # Save
 # ---------------------------------------------------------------------------
 
-def save_snapshot(symbol: str, chain_result: dict) -> bool:
+def save_snapshot(symbol: str, expiry_date: str, chain_result: dict) -> bool:
     """
-    Save one option-chain snapshot for `symbol` if the market is open.
+    Save one option-chain snapshot for `symbol`'s `expiry_date` contract,
+    if the market is open. expiry_date must be YYYY-MM-DD (use
+    parse_expiry_to_date() to convert a raw Fyers expiry value first).
     Returns True if a snapshot was written.
     """
     try:
@@ -157,12 +184,12 @@ def save_snapshot(symbol: str, chain_result: dict) -> bool:
             "rows"               : rows,
         }
 
-        path = _file_for(symbol, _today_str())
+        path = _file_for(symbol, expiry_date, _today_str())
         with open(path, "a") as f:
             f.write(json.dumps(snapshot) + "\n")
         return True
     except Exception as e:
-        logger.warning(f"chain_archive.save_snapshot({symbol}) failed: {e}")
+        logger.warning(f"chain_archive.save_snapshot({symbol}, {expiry_date}) failed: {e}")
         return False
 
 
@@ -170,9 +197,9 @@ def save_snapshot(symbol: str, chain_result: dict) -> bool:
 # Read
 # ---------------------------------------------------------------------------
 
-def load_day(symbol: str, date_str: str) -> list[dict]:
-    """Return all saved snapshots for a given date (YYYY-MM-DD), oldest first."""
-    path = _file_for(symbol, date_str)
+def load_day(symbol: str, expiry_date: str, capture_date: str) -> list[dict]:
+    """Return all saved snapshots for a given expiry+capture date, oldest first."""
+    path = _file_for(symbol, expiry_date, capture_date)
     if not os.path.exists(path):
         return []
     snapshots = []
@@ -188,23 +215,46 @@ def load_day(symbol: str, date_str: str) -> list[dict]:
     return snapshots
 
 
-def list_available_dates(symbol: str) -> list[str]:
-    """Return sorted list of dates (YYYY-MM-DD) that have at least one saved snapshot."""
+def list_expiries(symbol: str) -> list[str]:
+    """Return sorted list of expiry dates (YYYY-MM-DD) that have any archived data."""
     d = _symbol_dir(symbol)
     if not os.path.isdir(d):
         return []
-    dates = [f[:-6] for f in os.listdir(d) if f.endswith(".jsonl")]
-    return sorted(dates)
+    return sorted(f[4:] for f in os.listdir(d) if f.startswith("exp_"))
 
 
-def nearest_snapshot(symbol: str, date_str: str, target_epoch: int | None = None) -> dict | None:
+def list_available_dates(symbol: str, expiry_date: str | None = None) -> list[str]:
     """
-    Return the snapshot for a date closest to target_epoch (defaults to EOD/last snapshot
-    of that day — i.e. closing chain).
+    Return sorted list of capture dates (YYYY-MM-DD) that have saved data.
+    If expiry_date is given, restrict to that expiry's folder; otherwise
+    union across all expiries archived for this symbol.
     """
-    snaps = load_day(symbol, date_str)
+    if expiry_date:
+        d = _expiry_dir(symbol, expiry_date)
+        if not os.path.isdir(d):
+            return []
+        return sorted(f[:-6] for f in os.listdir(d) if f.endswith(".jsonl"))
+
+    all_dates: set[str] = set()
+    for exp in list_expiries(symbol):
+        all_dates.update(list_available_dates(symbol, exp))
+    return sorted(all_dates)
+
+
+def list_expiries_for_capture_date(symbol: str, capture_date: str) -> list[str]:
+    """Which expiry dates have a saved snapshot captured on this particular day?"""
+    return [exp for exp in list_expiries(symbol) if capture_date in list_available_dates(symbol, exp)]
+
+
+def nearest_snapshot(symbol: str, expiry_date: str, capture_date: str, target_epoch: int | None = None) -> dict | None:
+    """
+    Return the snapshot for a capture date closest to target_epoch (defaults
+    to the last snapshot of that day — i.e. the closing chain) for a given
+    expiry contract.
+    """
+    snaps = load_day(symbol, expiry_date, capture_date)
     if not snaps:
         return None
     if target_epoch is None:
-        return snaps[-1]   # last snapshot of the day ≈ closing chain
+        return snaps[-1]
     return min(snaps, key=lambda s: abs(s["t"] - target_epoch))
