@@ -73,17 +73,25 @@ def _archive_chains():
     """
     Every 5 min during market hours, save real option-chain snapshots to disk
     — for EVERY available expiry (weekly, next-weekly, monthly, ...) not just
-    whichever one happens to be "nearest".
+    whichever one happens to be "nearest". Logs per-expiry and total timing
+    so the actual cost on this device/network is visible in the server logs.
     """
+    cycle_start = time.time()
+    saved_count = 0
     for sym in ("NIFTY", "BANKNIFTY"):
         try:
             expiries = _market.get_expiries(sym).get("expiries", [])
             for exp in expiries:
                 expiry_date = chain_archive.parse_expiry_to_date(exp.get("expiry", ""))
+                t0 = time.time()
                 result = _market.get_option_chain(symbol=sym, expiry=exp.get("expiry", ""), strike_count=20)
-                chain_archive.save_snapshot(sym, expiry_date, result)
+                ok = chain_archive.save_snapshot(sym, expiry_date, result)
+                if ok:
+                    saved_count += 1
+                logger.info(f"Archive {sym} exp={expiry_date}: {time.time() - t0:.2f}s saved={ok}")
         except Exception as e:
             logger.warning(f"Archive snapshot failed for {sym}: {e}")
+    logger.info(f"Archive cycle complete: {saved_count} snapshots saved in {time.time() - cycle_start:.2f}s total")
 
 scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=3)
 scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=10)
