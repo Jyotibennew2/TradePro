@@ -373,8 +373,8 @@ def option_chain_archive_dates():
 def option_chain_archive_expiries():
     """
     Returns all expiry contracts that have ever been archived for this
-    symbol (exp_YYYY-MM-DD folders). Pass `date` (capture date, YYYY-MM-DD)
-    to instead get only the expiries that have a snapshot for that specific day.
+    symbol. Pass `date` (capture date, YYYY-MM-DD) to instead get only the
+    expiries that have a snapshot for that specific day.
     """
     symbol = request.args.get("symbol", "NIFTY")
     date   = request.args.get("date", "")
@@ -386,6 +386,12 @@ def option_chain_archive_expiries():
     else:
         expiries = chain_archive.list_expiries(symbol)
     return jsonify({"success": True, "symbol": symbol, "date": date or None, "expiries": expiries})
+
+
+@app.route("/api/optionchain/archive/stats")
+def option_chain_archive_stats():
+    """Diagnostics: total rows stored and the SQLite file's size on disk (MB)."""
+    return jsonify({"success": True, "data": chain_archive.db_stats()})
 
 # ---------------------------------------------------------------------------
 # Positions
