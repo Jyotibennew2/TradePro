@@ -407,7 +407,13 @@ class FyersService:
         return self._mock_option_chain(fyers_symbol, strike_count)
 
     def _mock_option_chain(self, symbol: str, count: int) -> dict:
-        """Generate realistic mock option chain data."""
+        """
+        Generate realistic mock option chain data — including bid/ask spread,
+        volume, and OI-change so downstream archiving/backtesting has the same
+        fields available in MOCK mode as in LIVE mode (Fyers returns
+        bid/ask/volume/oich per contract: strike_price, option_type, ltp,
+        ltpch, bid, ask, oi, oich, volume).
+        """
         import hashlib as _h
         base  = BASE_PRICES.get(symbol, 24300.0)
         spot  = round(base + math.sin(time.time() / 30) * base * 0.001, 2)
@@ -421,11 +427,24 @@ class FyersService:
             oi   = max(0.05, 1 - abs(K - spot) / (spot * 0.12)) * 1_200_000
             h    = int(_h.md5(str(K).encode()).hexdigest(), 16) % 1000 / 1000
             skew = round(14 + (1.5 if K < spot else -1) * (abs(K - spot) / spot) * 80, 1)
+
+            # Bid/ask spread widens for far OTM strikes (thinner liquidity)
+            dist_pct = abs(K - spot) / spot
+            spread_pct = 0.004 + dist_pct * 0.03
+            ce_spread = max(round(ce * spread_pct, 2), 0.05)
+            pe_spread = max(round(pe * spread_pct, 2), 0.05)
+
             rows.append({
                 "strike"  : K,
                 "ce_ltp"  : ce,   "pe_ltp"  : pe,
+                "ce_bid"  : round(max(ce - ce_spread / 2, 0.05), 2),
+                "ce_ask"  : round(ce + ce_spread / 2, 2),
+                "pe_bid"  : round(max(pe - pe_spread / 2, 0.05), 2),
+                "pe_ask"  : round(pe + pe_spread / 2, 2),
                 "ce_oi"   : int(oi * (0.7 + 0.6 * h)),       "pe_oi"  : int(oi * (0.7 + 0.6 * (1 - h))),
-                "ce_vol"  : int(oi * 0.4 * h),                "pe_vol" : int(oi * 0.4 * (1 - h)),
+                "ce_oich" : int(oi * (0.7 + 0.6 * h) * (random.random() - 0.5) * 0.15),
+                "pe_oich" : int(oi * (0.7 + 0.6 * (1 - h)) * (random.random() - 0.5) * 0.15),
+                "ce_volume": int(oi * 0.4 * h),               "pe_volume": int(oi * 0.4 * (1 - h)),
                 "ce_iv"   : skew, "pe_iv"   : skew,
                 "ce_delta": round(0.5 - (K - spot) / (spot * 0.3), 3),
                 "pe_delta": round(-0.5 - (K - spot) / (spot * 0.3), 3),
