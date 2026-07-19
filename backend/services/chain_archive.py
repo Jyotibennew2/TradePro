@@ -7,16 +7,19 @@ fragile/changing bhavcopy format.
 STORAGE: a single SQLite file at data/archive/chain_archive.db (stdlib only,
 no extra pip install — safe on Termux/ARM where wheels like pyarrow often
 fail to build). One row per (symbol, expiry, capture date, snapshot time,
-strike) — indexed for fast lookups, much smaller on disk than the previous
-JSON-Lines-per-day-per-expiry layout since field names aren't repeated.
+strike) — indexed for fast lookups, much smaller on disk than a JSON-based
+layout since field names aren't repeated per row.
 
 Each contract EXPIRY is archived separately (weekly, next-weekly, monthly, ...)
 so a user can later pick a specific expiry's chain, not just "whatever was
 nearest at capture time".
 
-IV + Greeks (delta/gamma/theta/vega) are already computed upstream by
-MarketDataService.get_option_chain() before this module ever sees the data
-— this module just persists whatever it's handed.
+Every field needed for real backtesting is captured per strike/side:
+timestamp, underlying price, expiry, strike, LTP, bid, ask, volume, OI,
+change in OI, IV, Delta, Gamma, Theta, Vega. IV + Greeks are computed
+upstream by MarketDataService.get_option_chain() before this module ever
+sees the data — everything else (bid/ask/volume/OI/OI-change) comes
+straight from Fyers (or the mock generator) and is just persisted here.
 
 Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 """
@@ -43,6 +46,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 DEFAULT_DAYS_TO_EXPIRY = 7   # kept here for reference in the response payload
 
+# Per-side (ce_/pe_) numeric columns stored for every strike
+_SIDE_COLUMNS = (
+    "ltp", "bid", "ask", "oi", "oi_change", "volume",
+    "iv", "delta", "gamma", "theta", "vega",
+)
+
 
 def _conn() -> sqlite3.Connection:
     """
@@ -59,7 +68,10 @@ def _conn() -> sqlite3.Connection:
 
 def _init_db() -> None:
     with _conn() as c:
-        c.execute("""
+        side_cols_sql = ",\n                ".join(
+            f"ce_{f} REAL, pe_{f} REAL" for f in _SIDE_COLUMNS
+        )
+        c.execute(f"""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol        TEXT    NOT NULL,
@@ -70,13 +82,7 @@ def _init_db() -> None:
                 mock          INTEGER NOT NULL,
                 days_to_expiry_used INTEGER,
                 strike        REAL    NOT NULL,
-                ce_ltp        REAL, pe_ltp REAL,
-                ce_oi         REAL, pe_oi  REAL,
-                ce_iv         REAL, pe_iv  REAL,
-                ce_delta      REAL, pe_delta REAL,
-                ce_gamma      REAL, pe_gamma REAL,
-                ce_theta      REAL, pe_theta REAL,
-                ce_vega       REAL, pe_vega  REAL,
+                {side_cols_sql},
                 atm           INTEGER
             )
         """)
@@ -84,6 +90,16 @@ def _init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_lookup
             ON snapshots (symbol, expiry_date, capture_date, captured_at)
         """)
+        # Migration: add any columns missing from an older DB (safe no-op if already present)
+        existing = {row["name"] for row in c.execute("PRAGMA table_info(snapshots)")}
+        for f in _SIDE_COLUMNS:
+            for side in ("ce", "pe"):
+                col = f"{side}_{f}"
+                if col not in existing:
+                    try:
+                        c.execute(f"ALTER TABLE snapshots ADD COLUMN {col} REAL")
+                    except sqlite3.OperationalError:
+                        pass
 
 
 _init_db()
@@ -118,10 +134,31 @@ def parse_expiry_to_date(expiry_raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Normalize whichever chain shape we were given into strike-keyed CE/PE data
+# Normalize whichever chain shape we were given into strike-keyed CE/PE data.
+# Handles both response shapes:
+#   - mock/reconstructed: data.expiryData = [{strike, ce_ltp, ce_bid, ce_ask,
+#                                              ce_oi, ce_oich, ce_volume,
+#                                              ce_iv, ce_delta, ..., pe_*}]
+#   - live Fyers         : data.optionsChain = [{strike_price, option_type,
+#                                                 ltp, bid, ask, oi, oich,
+#                                                 volume, iv, delta, ...}]
+#     (Greeks/iv are added onto the live rows upstream by MarketDataService)
 # ---------------------------------------------------------------------------
 
-_GREEK_FIELDS = ("iv", "delta", "gamma", "theta", "vega")
+# Map our internal field name -> (mock key suffix, live Fyers key)
+_FIELD_MAP = {
+    "ltp"      : ("ltp",   "ltp"),
+    "bid"      : ("bid",   "bid"),
+    "ask"      : ("ask",   "ask"),
+    "oi"       : ("oi",    "oi"),
+    "oi_change": ("oich",  "oich"),
+    "volume"   : ("volume","volume"),
+    "iv"       : ("iv",    "iv"),
+    "delta"    : ("delta", "delta"),
+    "gamma"    : ("gamma", "gamma"),
+    "theta"    : ("theta", "theta"),
+    "vega"     : ("vega",  "vega"),
+}
 
 
 def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
@@ -131,13 +168,12 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
     if expiry_data and isinstance(expiry_data, list) and expiry_data and "strike" in expiry_data[0]:
         rows = []
         for r in expiry_data:
-            row = {"strike": r.get("strike"), "ce_ltp": r.get("ce_ltp"), "pe_ltp": r.get("pe_ltp"),
-                   "ce_oi": r.get("ce_oi"), "pe_oi": r.get("pe_oi")}
-            for f in _GREEK_FIELDS:
-                if r.get(f"ce_{f}") is not None:
-                    row[f"ce_{f}"] = r[f"ce_{f}"]
-                if r.get(f"pe_{f}") is not None:
-                    row[f"pe_{f}"] = r[f"pe_{f}"]
+            row = {"strike": r.get("strike")}
+            for field, (mock_key, _) in _FIELD_MAP.items():
+                if r.get(f"ce_{mock_key}") is not None:
+                    row[f"ce_{field}"] = r[f"ce_{mock_key}"]
+                if r.get(f"pe_{mock_key}") is not None:
+                    row[f"pe_{field}"] = r[f"pe_{mock_key}"]
             rows.append(row)
         return rows, chain_result.get("spot", 0) or 0
 
@@ -160,13 +196,12 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
         rows = []
         for k in strikes:
             ce, pe = ce_map.get(k, {}), pe_map.get(k, {})
-            row = {"strike": k, "ce_ltp": ce.get("ltp"), "pe_ltp": pe.get("ltp"),
-                   "ce_oi": ce.get("oi"), "pe_oi": pe.get("oi")}
-            for f in _GREEK_FIELDS:
-                if ce.get(f) is not None:
-                    row[f"ce_{f}"] = ce[f]
-                if pe.get(f) is not None:
-                    row[f"pe_{f}"] = pe[f]
+            row = {"strike": k}
+            for field, (_, live_key) in _FIELD_MAP.items():
+                if ce.get(live_key) is not None:
+                    row[f"ce_{field}"] = ce[live_key]
+                if pe.get(live_key) is not None:
+                    row[f"pe_{field}"] = pe[live_key]
             rows.append(row)
         return rows, spot
 
@@ -199,25 +234,23 @@ def save_snapshot(symbol: str, expiry_date: str, chain_result: dict) -> bool:
         capture_date = _today_str()
         mock = int(bool(chain_result.get("mock", True)))
 
-        values = [(
-            symbol, expiry_date, capture_date, captured_at, spot, mock, DEFAULT_DAYS_TO_EXPIRY,
-            r.get("strike"),
-            r.get("ce_ltp"), r.get("pe_ltp"), r.get("ce_oi"), r.get("pe_oi"),
-            r.get("ce_iv"), r.get("pe_iv"), r.get("ce_delta"), r.get("pe_delta"),
-            r.get("ce_gamma"), r.get("pe_gamma"), r.get("ce_theta"), r.get("pe_theta"),
-            r.get("ce_vega"), r.get("pe_vega"),
-            int(r.get("strike") == atm),
-        ) for r in rows]
+        side_cols = [f"{side}_{f}" for f in _SIDE_COLUMNS for side in ("ce", "pe")]
+        col_list  = ", ".join(["symbol", "expiry_date", "capture_date", "captured_at", "spot", "mock",
+                                "days_to_expiry_used", "strike"] + side_cols + ["atm"])
+        placeholders = ", ".join(["?"] * (8 + len(side_cols) + 1))
+
+        values = []
+        for r in rows:
+            row_vals = [
+                symbol, expiry_date, capture_date, captured_at, spot, mock, DEFAULT_DAYS_TO_EXPIRY,
+                r.get("strike"),
+            ]
+            row_vals += [r.get(col) for col in side_cols]
+            row_vals.append(int(r.get("strike") == atm))
+            values.append(tuple(row_vals))
 
         with _conn() as c:
-            c.executemany("""
-                INSERT INTO snapshots (
-                    symbol, expiry_date, capture_date, captured_at, spot, mock, days_to_expiry_used,
-                    strike, ce_ltp, pe_ltp, ce_oi, pe_oi,
-                    ce_iv, pe_iv, ce_delta, pe_delta, ce_gamma, pe_gamma, ce_theta, pe_theta,
-                    ce_vega, pe_vega, atm
-                ) VALUES (?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?)
-            """, values)
+            c.executemany(f"INSERT INTO snapshots ({col_list}) VALUES ({placeholders})", values)
         return True
     except Exception as e:
         logger.warning(f"chain_archive.save_snapshot({symbol}, {expiry_date}) failed: {e}")
@@ -232,19 +265,17 @@ def _rows_to_snapshot(db_rows: list[sqlite3.Row]) -> dict:
     if not db_rows:
         return {}
     first = db_rows[0]
+    out_rows = []
+    for r in db_rows:
+        row = {"strike": r["strike"], "atm": bool(r["atm"])}
+        for f in _SIDE_COLUMNS:
+            row[f"ce_{f}"] = r[f"ce_{f}"]
+            row[f"pe_{f}"] = r[f"pe_{f}"]
+        out_rows.append(row)
     return {
         "t": first["captured_at"], "spot": first["spot"], "mock": bool(first["mock"]),
         "days_to_expiry_used": first["days_to_expiry_used"],
-        "rows": [{
-            "strike": r["strike"], "ce_ltp": r["ce_ltp"], "pe_ltp": r["pe_ltp"],
-            "ce_oi": r["ce_oi"], "pe_oi": r["pe_oi"],
-            "ce_iv": r["ce_iv"], "pe_iv": r["pe_iv"],
-            "ce_delta": r["ce_delta"], "pe_delta": r["pe_delta"],
-            "ce_gamma": r["ce_gamma"], "pe_gamma": r["pe_gamma"],
-            "ce_theta": r["ce_theta"], "pe_theta": r["pe_theta"],
-            "ce_vega": r["ce_vega"], "pe_vega": r["pe_vega"],
-            "atm": bool(r["atm"]),
-        } for r in db_rows],
+        "rows": out_rows,
     }
 
 
