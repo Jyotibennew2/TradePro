@@ -284,8 +284,9 @@ def option_chain_archive():
     """
     Returns REAL saved option-chain snapshots for a given capture date and
     expiry. Unlike /historical (which is a Black-Scholes reconstruction),
-    this is genuine live data that was captured and stored — including IV
-    and Greeks backed out from the real traded LTP at save time.
+    this is genuine live data that was captured and stored — full
+    backtesting field set: timestamp, underlying price, expiry, strike,
+    LTP, bid, ask, volume, OI, change in OI, IV, Delta, Gamma, Theta, Vega.
 
     Query params:
       symbol  - NIFTY / BANKNIFTY
@@ -315,22 +316,19 @@ def option_chain_archive():
             return error(f"No archived data saved for {symbol} expiry {expiry} on {date}", 404)
 
         rows = [{
-            "strike"  : r["strike"],
-            "ce_ltp"  : r.get("ce_ltp"),
-            "pe_ltp"  : r.get("pe_ltp"),
-            "ce_oi"   : r.get("ce_oi"),
-            "pe_oi"   : r.get("pe_oi"),
-            "ce_iv"   : r.get("ce_iv"),
-            "pe_iv"   : r.get("pe_iv"),
-            "ce_delta": r.get("ce_delta"),
-            "pe_delta": r.get("pe_delta"),
-            "ce_gamma": r.get("ce_gamma"),
-            "pe_gamma": r.get("pe_gamma"),
-            "ce_theta": r.get("ce_theta"),
-            "pe_theta": r.get("pe_theta"),
-            "ce_vega" : r.get("ce_vega"),
-            "pe_vega" : r.get("pe_vega"),
-            "atm"     : r.get("atm", False),
+            "strike"      : r["strike"],
+            "ce_ltp"      : r.get("ce_ltp"),      "pe_ltp"      : r.get("pe_ltp"),
+            "ce_bid"      : r.get("ce_bid"),      "pe_bid"      : r.get("pe_bid"),
+            "ce_ask"      : r.get("ce_ask"),      "pe_ask"      : r.get("pe_ask"),
+            "ce_oi"       : r.get("ce_oi"),       "pe_oi"       : r.get("pe_oi"),
+            "ce_oi_change": r.get("ce_oi_change"),"pe_oi_change": r.get("pe_oi_change"),
+            "ce_volume"   : r.get("ce_volume"),   "pe_volume"   : r.get("pe_volume"),
+            "ce_iv"       : r.get("ce_iv"),       "pe_iv"       : r.get("pe_iv"),
+            "ce_delta"    : r.get("ce_delta"),    "pe_delta"    : r.get("pe_delta"),
+            "ce_gamma"    : r.get("ce_gamma"),    "pe_gamma"    : r.get("pe_gamma"),
+            "ce_theta"    : r.get("ce_theta"),    "pe_theta"    : r.get("pe_theta"),
+            "ce_vega"     : r.get("ce_vega"),     "pe_vega"     : r.get("pe_vega"),
+            "atm"         : r.get("atm", False),
         } for r in snapshot["rows"]]
 
         return jsonify({
