@@ -349,6 +349,21 @@ def list_expiries_for_capture_date(symbol: str, capture_date: str) -> list[str]:
     return [r["expiry_date"] for r in rows]
 
 
+def list_snapshot_times(symbol: str, expiry_date: str, capture_date: str) -> list[int]:
+    """
+    Return sorted list of captured_at unix timestamps for this expiry+capture
+    date — used to step forward/backward through the day's snapshots for
+    replay / walk-forward backtesting in the Simulator.
+    """
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT DISTINCT captured_at FROM snapshots
+            WHERE symbol=? AND expiry_date=? AND capture_date=?
+            ORDER BY captured_at
+        """, (symbol, expiry_date, capture_date)).fetchall()
+    return [r["captured_at"] for r in rows]
+
+
 def db_stats() -> dict:
     """Quick diagnostics: row count and file size — useful for checking storage growth."""
     size_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
