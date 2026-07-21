@@ -293,11 +293,15 @@ def option_chain_archive():
       date    - capture date, YYYY-MM-DD (required)
       expiry  - contract expiry date, YYYY-MM-DD (optional — defaults to
                 the nearest expiry that has data for this capture date)
+      time    - unix epoch seconds (optional) — picks the snapshot closest
+                to this exact moment (for stepping through the day's replay);
+                omit for the last snapshot of the day (closing chain)
     """
     try:
         symbol = request.args.get("symbol", "NIFTY")
         date   = request.args.get("date", "")     # capture date YYYY-MM-DD
         expiry = request.args.get("expiry", "")   # contract expiry YYYY-MM-DD
+        at     = request.args.get("time", "")     # unix epoch seconds
 
         ok, msg = validate_symbol(symbol)
         if not ok:
@@ -311,7 +315,8 @@ def option_chain_archive():
                 return error(f"No archived data saved for {symbol} on {date}", 404)
             expiry = available[0]   # nearest (folders are sorted ascending)
 
-        snapshot = chain_archive.nearest_snapshot(symbol, expiry, date)
+        target_epoch = int(at) if at else None
+        snapshot = chain_archive.nearest_snapshot(symbol, expiry, date, target_epoch)
         if not snapshot:
             return error(f"No archived data saved for {symbol} expiry {expiry} on {date}", 404)
 
@@ -384,6 +389,28 @@ def option_chain_archive_expiries():
     else:
         expiries = chain_archive.list_expiries(symbol)
     return jsonify({"success": True, "symbol": symbol, "date": date or None, "expiries": expiries})
+
+
+@app.route("/api/optionchain/archive/times")
+def option_chain_archive_times():
+    """
+    Returns every captured_at timestamp (unix epoch seconds) available for
+    a given symbol+expiry+capture date — used by the Simulator's replay/
+    walk-forward controls to step forward and backward through the day at
+    whatever granularity (5m/15m/30m/1h/2h/1d) the user picks.
+    """
+    symbol = request.args.get("symbol", "NIFTY")
+    date   = request.args.get("date", "")
+    expiry = request.args.get("expiry", "")
+    ok, msg = validate_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    if not date or not expiry:
+        return error("date and expiry (YYYY-MM-DD) are required", 400)
+    return jsonify({
+        "success": True, "symbol": symbol, "date": date, "expiry": expiry,
+        "times"  : chain_archive.list_snapshot_times(symbol, expiry, date),
+    })
 
 
 @app.route("/api/optionchain/archive/stats")
