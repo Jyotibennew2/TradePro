@@ -458,7 +458,7 @@ def funds():
     return jsonify(_svc.get_funds())
 
 # ---------------------------------------------------------------------------
-# Backtest
+# Backtest (synthetic — Black-Scholes over historical spot only)
 # ---------------------------------------------------------------------------
 
 @app.route("/api/backtest", methods=["POST"])
@@ -576,6 +576,122 @@ def backtest():
         "trades"      : trades[-50:],
         "equity_curve": equity,
     })
+
+# ---------------------------------------------------------------------------
+# Walk-forward backtest — real archived LTPs, not a simulation
+# ---------------------------------------------------------------------------
+
+@app.route("/api/backtest/walkforward", methods=["POST"])
+def backtest_walkforward():
+    """
+    Replays a specific multi-leg strategy forward through REAL archived
+    option-chain snapshots (not Black-Scholes) starting from an entry point,
+    applying SL/target rules against the actual premium changes that
+    happened. Only works for dates/expiries TradePro has archived data for.
+
+    Body:
+      symbol     : "NIFTY" | "BANKNIFTY"
+      expiry     : contract expiry, YYYY-MM-DD
+      entry_time : unix epoch seconds — the snapshot to enter at
+      legs       : [{ "strike": 24300, "option_type": "CE"|"PE",
+                       "action": "BUY"|"SELL", "lots": 1 }, ...]
+      lot_size   : contract lot size (e.g. 50 for NIFTY)
+      sl_pct     : stop loss, % of entry premium (e.g. 50)
+      tgt_pct    : target, % of entry premium (e.g. 50)
+      exit_time  : optional unix epoch — hard cutoff even if SL/target not hit
+    """
+    try:
+        b          = request.json or {}
+        symbol     = b.get("symbol", "NIFTY")
+        expiry     = b.get("expiry", "")
+        entry_time = b.get("entry_time")
+        legs       = b.get("legs", [])
+        lot_size   = int(b.get("lot_size", 50))
+        sl_pct     = float(b.get("sl_pct", 50))
+        tgt_pct    = float(b.get("tgt_pct", 50))
+        exit_time  = b.get("exit_time")
+
+        ok, msg = validate_symbol(symbol)
+        if not ok:
+            return error(msg, 400)
+        if not expiry or not entry_time or not legs:
+            return error("expiry, entry_time and legs are required", 400)
+
+        entry_time = int(entry_time)
+        exit_time  = int(exit_time) if exit_time else None
+
+        snapshots = chain_archive.list_snapshots_range(symbol, expiry, entry_time, exit_time)
+        if not snapshots:
+            return error(f"No archived snapshots found for {symbol} exp={expiry} from that entry time onward", 404)
+
+        def leg_price(snapshot: dict, strike: float, otype: str) -> float | None:
+            for r in snapshot["rows"]:
+                if r["strike"] == strike:
+                    return r.get("ce_ltp") if otype == "CE" else r.get("pe_ltp")
+            return None
+
+        entry_snap = snapshots[0]
+        entry_prices: dict[int, float] = {}
+        entry_premium_abs = 0.0
+        for i, leg in enumerate(legs):
+            p = leg_price(entry_snap, leg["strike"], leg["option_type"])
+            if p is None:
+                return error(f"Strike {leg['strike']} {leg['option_type']} not found in entry snapshot (outside archived range)", 400)
+            entry_prices[i] = p
+            qty = int(leg.get("lots", 1)) * lot_size
+            entry_premium_abs += p * qty
+
+        sl_amount  = entry_premium_abs * sl_pct  / 100
+        tgt_amount = entry_premium_abs * tgt_pct / 100
+
+        equity_curve = []
+        exit_reason  = "data_ended"
+        exit_snap    = entry_snap
+        is_mock      = bool(entry_snap.get("mock", True))
+
+        for snap in snapshots:
+            pnl = 0.0
+            missing = False
+            for i, leg in enumerate(legs):
+                p = leg_price(snap, leg["strike"], leg["option_type"])
+                if p is None:
+                    missing = True
+                    break
+                qty  = int(leg.get("lots", 1)) * lot_size
+                sign = 1 if leg["action"] == "BUY" else -1
+                pnl += (p - entry_prices[i]) * qty * sign
+            if missing:
+                continue
+
+            equity_curve.append({"t": snap["t"], "pnl": round(pnl, 2), "spot": snap["spot"]})
+            exit_snap = snap
+
+            if pnl <= -sl_amount:
+                exit_reason = "SL Hit"
+                break
+            if pnl >= tgt_amount:
+                exit_reason = "Target Hit"
+                break
+
+        final_pnl = equity_curve[-1]["pnl"] if equity_curve else 0.0
+
+        return jsonify({
+            "success"          : True,
+            "symbol"           : symbol,
+            "expiry"           : expiry,
+            "was_mock"         : is_mock,
+            "entry"            : {"t": entry_snap["t"], "spot": entry_snap["spot"], "premium_abs": round(entry_premium_abs, 2)},
+            "exit"             : {"t": exit_snap["t"], "spot": exit_snap["spot"], "reason": exit_reason},
+            "sl_amount"        : round(sl_amount, 2),
+            "tgt_amount"       : round(tgt_amount, 2),
+            "final_pnl"        : round(final_pnl, 2),
+            "equity_curve"     : equity_curve,
+            "snapshots_used"   : len(equity_curve),
+            "note"             : "Walk-forward: entry/exit premiums are real archived LTPs for these exact strikes, not simulated.",
+        })
+    except Exception as e:
+        logger.error(f"Walk-forward backtest error: {e}")
+        return error(str(e), 400)
 
 # ===========================================================================
 # NEW APIs — Sprint 3
