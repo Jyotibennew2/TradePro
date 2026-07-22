@@ -364,6 +364,42 @@ def list_snapshot_times(symbol: str, expiry_date: str, capture_date: str) -> lis
     return [r["captured_at"] for r in rows]
 
 
+def list_snapshots_range(symbol: str, expiry_date: str, from_epoch: int, to_epoch: int | None = None) -> list[dict]:
+    """
+    Return every archived snapshot for this expiry contract between
+    from_epoch and to_epoch (inclusive), across however many capture dates
+    that spans, ordered by time. Used by the walk-forward backtest engine
+    to replay a trade's entire holding period using real captured LTPs
+    (not a Black-Scholes simulation).
+    """
+    with _conn() as c:
+        if to_epoch is None:
+            rows = c.execute("""
+                SELECT DISTINCT captured_at FROM snapshots
+                WHERE symbol=? AND expiry_date=? AND captured_at >= ?
+                ORDER BY captured_at
+            """, (symbol, expiry_date, from_epoch)).fetchall()
+        else:
+            rows = c.execute("""
+                SELECT DISTINCT captured_at FROM snapshots
+                WHERE symbol=? AND expiry_date=? AND captured_at BETWEEN ? AND ?
+                ORDER BY captured_at
+            """, (symbol, expiry_date, from_epoch, to_epoch)).fetchall()
+        times = [r["captured_at"] for r in rows]
+
+        snapshots = []
+        for t in times:
+            db_rows = c.execute("""
+                SELECT * FROM snapshots
+                WHERE symbol=? AND expiry_date=? AND captured_at=?
+                ORDER BY strike
+            """, (symbol, expiry_date, t)).fetchall()
+            snap = _rows_to_snapshot(db_rows)
+            if snap:
+                snapshots.append(snap)
+        return snapshots
+
+
 def db_stats() -> dict:
     """Quick diagnostics: row count and file size — useful for checking storage growth."""
     size_bytes = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
