@@ -32,7 +32,14 @@ fi
 # Copy to a temp file first so we never upload a half-written DB if the
 # scheduler happens to be writing to it at the exact same second (SQLite
 # WAL mode makes this rare, but this makes the backup atomic regardless).
-TMP_COPY="/tmp/${BACKUP_NAME}"
+#
+# NOTE: /tmp is NOT writable on Termux/Android (sandboxed filesystem), so the
+# temp copy is made inside the archive folder itself instead - that folder is
+# guaranteed writable since it's where chain_archive.db itself lives. This
+# also makes the script portable to a plain Linux/VPS box without changes.
+TMP_DIR="$(dirname "$DB_PATH")/.backup_tmp"
+mkdir -p "$TMP_DIR"
+TMP_COPY="${TMP_DIR}/${BACKUP_NAME}"
 cp "$DB_PATH" "$TMP_COPY"
 
 rclone copy "$TMP_COPY" "$DRIVE_FOLDER/" --create-empty-src-dirs 2>> "$LOG_FILE"
