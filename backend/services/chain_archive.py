@@ -21,6 +21,12 @@ upstream by MarketDataService.get_option_chain() before this module ever
 sees the data — everything else (bid/ask/volume/OI/OI-change) comes
 straight from Fyers (or the mock generator) and is just persisted here.
 
+This same table also stores Delta Exchange crypto option snapshots (symbol
+"BTC"/"ETH") via delta_service.get_option_chain() — same schema, same fast
+simulator queries. Crypto trades 24/7, so save_snapshot() accepts
+require_market_hours=False for those calls to skip the IST 9:15-15:30
+NSE-hours gate that only makes sense for NIFTY/BANKNIFTY.
+
 Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 """
 
@@ -139,10 +145,11 @@ def parse_expiry_to_date(expiry_raw: str) -> str:
 #   - mock/reconstructed: data.expiryData = [{strike, ce_ltp, ce_bid, ce_ask,
 #                                              ce_oi, ce_oich, ce_volume,
 #                                              ce_iv, ce_delta, ..., pe_*}]
-#   - live Fyers         : data.optionsChain = [{strike_price, option_type,
+#   - live Fyers / Delta : data.optionsChain = [{strike_price, option_type,
 #                                                 ltp, bid, ask, oi, oich,
 #                                                 volume, iv, delta, ...}]
-#     (Greeks/iv are added onto the live rows upstream by MarketDataService)
+#     (Greeks/iv are added onto the live rows upstream by MarketDataService,
+#     or come straight from Delta Exchange's ticker Greeks for crypto)
 # ---------------------------------------------------------------------------
 
 # Map our internal field name -> (mock key suffix, live Fyers key)
@@ -212,15 +219,21 @@ def _normalize_rows(chain_result: dict) -> tuple[list[dict], float]:
 # Save
 # ---------------------------------------------------------------------------
 
-def save_snapshot(symbol: str, expiry_date: str, chain_result: dict) -> bool:
+def save_snapshot(symbol: str, expiry_date: str, chain_result: dict, require_market_hours: bool = True) -> bool:
     """
-    Save one option-chain snapshot for `symbol`'s `expiry_date` contract,
-    if the market is open. expiry_date must be YYYY-MM-DD (use
-    parse_expiry_to_date() to convert a raw Fyers expiry value first).
+    Save one option-chain snapshot for `symbol`'s `expiry_date` contract.
+    expiry_date must be YYYY-MM-DD (use parse_expiry_to_date() to convert a
+    raw Fyers expiry value first).
+
+    require_market_hours: True (default) gates saving to NSE hours
+    (9:15-15:30 IST, weekdays) — correct for NIFTY/BANKNIFTY. Pass False for
+    24/7 markets like Delta Exchange crypto options (BTC/ETH), which have no
+    such window.
+
     Returns True if a snapshot was written.
     """
     try:
-        if not _within_market_hours():
+        if require_market_hours and not _within_market_hours():
             return False
 
         rows, spot = _normalize_rows(chain_result)
