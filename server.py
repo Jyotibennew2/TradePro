@@ -97,12 +97,13 @@ def _archive_chains():
 
 def _archive_delta():
     """
-    Every 5 min, save real Delta Exchange BTC/ETH option-chain snapshots.
+    Every 5 min, save real Delta Exchange BTC/ETH option-chain snapshots —
+    EVERY live expiry, same as NIFTY/BANKNIFTY get above, so all symbols
+    have equally complete data (all strikes, bid/ask/OI/volume/greeks).
     Unlike NIFTY/BANKNIFTY, crypto trades 24/7 so there's no market-hours
-    gate (require_market_hours=False). Only the nearest MAX_ARCHIVED_EXPIRIES
-    expiries are archived per underlying to keep storage small — crypto
-    options expire daily, so archiving everything would bloat the DB fast
-    for little backtesting value.
+    gate (require_market_hours=False). Note: crypto options expire daily,
+    so this DB grows faster than the NSE indices — check size periodically
+    via GET /api/optionchain/archive/stats.
     """
     cycle_start = time.time()
     saved_count = 0
@@ -481,12 +482,12 @@ def delta_option_chain():
 
 @app.route("/api/delta/optionchain/expiries")
 def delta_option_chain_expiries():
-    """Nearest live expiries currently listed on Delta Exchange for this underlying."""
+    """All live expiries currently listed on Delta Exchange for this underlying."""
     symbol = request.args.get("symbol", "BTC").upper()
     ok, msg = _validate_delta_symbol(symbol)
     if not ok:
         return error(msg, 400)
-    return jsonify({"success": True, "symbol": symbol, "expiries": delta_service.get_expiries(symbol, max_expiries=10)})
+    return jsonify({"success": True, "symbol": symbol, "expiries": delta_service.get_expiries(symbol)})
 
 
 @app.route("/api/delta/optionchain/archive")
