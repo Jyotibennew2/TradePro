@@ -28,11 +28,12 @@ _TIMEOUT = 10
 
 SUPPORTED_UNDERLYINGS = ("BTC", "ETH")
 
-# Cap how many upcoming expiries we archive per underlying. Crypto options on
-# Delta expire daily, so archiving every listed expiry would grow the DB fast
-# for no real benefit - we only care about near-term contracts for the
-# simulator/backtester. Keeps storage small per the "kam jagah" requirement.
-MAX_ARCHIVED_EXPIRIES = 2
+# No cap by default - archive EVERY live expiry, same as NIFTY/BANKNIFTY, so
+# BTC/ETH get equally complete data (all expiries, all strikes, bid/ask/OI/
+# greeks). Crypto expires daily so this grows the DB faster than the NSE
+# indices; keep an eye on size via GET /api/optionchain/archive/stats and
+# pass a specific max_expiries if it needs trimming later.
+MAX_ARCHIVED_EXPIRIES = None
 
 
 def _get(path: str, params: dict | None = None) -> dict:
@@ -53,10 +54,13 @@ def _parse_expiry_from_symbol(symbol: str) -> str | None:
         return None
 
 
-def get_expiries(underlying: str, max_expiries: int = MAX_ARCHIVED_EXPIRIES) -> list[str]:
+def get_expiries(underlying: str, max_expiries: int | None = MAX_ARCHIVED_EXPIRIES) -> list[str]:
     """
-    Returns the soonest `max_expiries` expiry dates (YYYY-MM-DD) that
-    currently have live BTC/ETH option contracts on Delta Exchange.
+    Returns every live expiry date (YYYY-MM-DD) that currently has BTC/ETH
+    option contracts on Delta Exchange, soonest first. Pass max_expiries to
+    cap the count (e.g. for the live-chain-picker UI); leave it None (default)
+    to get ALL of them, which is what the 5-min archiver uses so crypto is
+    archived just as fully as NIFTY/BANKNIFTY.
     """
     underlying = underlying.upper()
     if underlying not in SUPPORTED_UNDERLYINGS:
@@ -68,7 +72,7 @@ def get_expiries(underlying: str, max_expiries: int = MAX_ARCHIVED_EXPIRIES) -> 
         })
         symbols = {item.get("symbol", "") for item in data.get("result", [])}
         expiries = sorted({d for d in (_parse_expiry_from_symbol(s) for s in symbols) if d})
-        return expiries[:max_expiries]
+        return expiries[:max_expiries] if max_expiries else expiries
     except Exception as e:
         logger.warning(f"delta_service.get_expiries({underlying}) failed: {e}")
         return []
