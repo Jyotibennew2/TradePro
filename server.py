@@ -26,6 +26,7 @@ from backend.validators     import (
 from backend.fyers_service      import FyersService
 from backend.services.market_data import MarketDataService
 from backend.services            import chain_archive
+from backend.services            import delta_service
 from backend.greeks             import GreeksEngine
 from backend.strategy           import StrategyEngine
 from backend.scanner            import ScannerEngine
@@ -93,10 +94,36 @@ def _archive_chains():
             logger.warning(f"Archive snapshot failed for {sym}: {e}")
     logger.info(f"Archive cycle complete: {saved_count} snapshots saved in {time.time() - cycle_start:.2f}s total")
 
+
+def _archive_delta():
+    """
+    Every 5 min, save real Delta Exchange BTC/ETH option-chain snapshots.
+    Unlike NIFTY/BANKNIFTY, crypto trades 24/7 so there's no market-hours
+    gate (require_market_hours=False). Only the nearest MAX_ARCHIVED_EXPIRIES
+    expiries are archived per underlying to keep storage small — crypto
+    options expire daily, so archiving everything would bloat the DB fast
+    for little backtesting value.
+    """
+    cycle_start = time.time()
+    saved_count = 0
+    for sym in delta_service.SUPPORTED_UNDERLYINGS:
+        try:
+            for expiry_date in delta_service.get_expiries(sym):
+                t0 = time.time()
+                result = delta_service.get_option_chain(sym, expiry_date)
+                ok = chain_archive.save_snapshot(sym, expiry_date, result, require_market_hours=False)
+                if ok:
+                    saved_count += 1
+                logger.info(f"Delta archive {sym} exp={expiry_date}: {time.time() - t0:.2f}s saved={ok}")
+        except Exception as e:
+            logger.warning(f"Delta archive snapshot failed for {sym}: {e}")
+    logger.info(f"Delta archive cycle complete: {saved_count} snapshots saved in {time.time() - cycle_start:.2f}s total")
+
 scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=3)
 scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=10)
 scheduler.add_task("cache_cleanup",   lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
 scheduler.add_task("archive_chains",  _archive_chains,                      interval=300)
+scheduler.add_task("archive_delta",   _archive_delta,                       interval=300)
 scheduler.start()
 
 # ===========================================================================
@@ -419,6 +446,155 @@ def option_chain_archive_stats():
     return jsonify({"success": True, "data": chain_archive.db_stats()})
 
 # ---------------------------------------------------------------------------
+# Delta Exchange Option Chain (BTC / ETH crypto options)
+# Live data + archived snapshots — mirrors the NIFTY/BANKNIFTY archive APIs
+# above, same SQLite table, just symbol="BTC"/"ETH" instead of NIFTY/BANKNIFTY.
+# No market-hours restriction since crypto trades 24/7.
+# ---------------------------------------------------------------------------
+
+def _validate_delta_symbol(symbol: str):
+    if symbol.upper() not in delta_service.SUPPORTED_UNDERLYINGS:
+        return False, f"symbol must be one of {delta_service.SUPPORTED_UNDERLYINGS}"
+    return True, ""
+
+
+@app.route("/api/delta/optionchain")
+def delta_option_chain():
+    """Live BTC/ETH option chain, fetched fresh from Delta Exchange (public API, no key needed)."""
+    symbol = request.args.get("symbol", "BTC").upper()
+    expiry = request.args.get("expiry", "")  # YYYY-MM-DD
+
+    ok, msg = _validate_delta_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    if not expiry:
+        expiries = delta_service.get_expiries(symbol, max_expiries=1)
+        if not expiries:
+            return error(f"No live expiries found for {symbol}", 404)
+        expiry = expiries[0]
+
+    result = delta_service.get_option_chain(symbol, expiry)
+    if not result.get("success"):
+        return error(f"Could not fetch {symbol} option chain for {expiry}", 502)
+    return jsonify(result)
+
+
+@app.route("/api/delta/optionchain/expiries")
+def delta_option_chain_expiries():
+    """Nearest live expiries currently listed on Delta Exchange for this underlying."""
+    symbol = request.args.get("symbol", "BTC").upper()
+    ok, msg = _validate_delta_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    return jsonify({"success": True, "symbol": symbol, "expiries": delta_service.get_expiries(symbol, max_expiries=10)})
+
+
+@app.route("/api/delta/optionchain/archive")
+def delta_option_chain_archive():
+    """
+    Returns REAL saved BTC/ETH option-chain snapshots for a given capture
+    date and expiry — same field set as /api/optionchain/archive.
+
+    Query params: symbol (BTC/ETH), date (YYYY-MM-DD, required),
+    expiry (YYYY-MM-DD, optional), time (unix epoch seconds, optional).
+    """
+    try:
+        symbol = request.args.get("symbol", "BTC").upper()
+        date   = request.args.get("date", "")
+        expiry = request.args.get("expiry", "")
+        at     = request.args.get("time", "")
+
+        ok, msg = _validate_delta_symbol(symbol)
+        if not ok:
+            return error(msg, 400)
+        if not date:
+            return error("date (YYYY-MM-DD) is required", 400)
+
+        if not expiry:
+            available = chain_archive.list_expiries_for_capture_date(symbol, date)
+            if not available:
+                return error(f"No archived data saved for {symbol} on {date}", 404)
+            expiry = available[0]
+
+        target_epoch = int(at) if at else None
+        snapshot = chain_archive.nearest_snapshot(symbol, expiry, date, target_epoch)
+        if not snapshot:
+            return error(f"No archived data saved for {symbol} expiry {expiry} on {date}", 404)
+
+        rows = [{
+            "strike"      : r["strike"],
+            "ce_ltp"      : r.get("ce_ltp"),      "pe_ltp"      : r.get("pe_ltp"),
+            "ce_bid"      : r.get("ce_bid"),      "pe_bid"      : r.get("pe_bid"),
+            "ce_ask"      : r.get("ce_ask"),      "pe_ask"      : r.get("pe_ask"),
+            "ce_oi"       : r.get("ce_oi"),       "pe_oi"       : r.get("pe_oi"),
+            "ce_volume"   : r.get("ce_volume"),   "pe_volume"   : r.get("pe_volume"),
+            "ce_iv"       : r.get("ce_iv"),       "pe_iv"       : r.get("pe_iv"),
+            "ce_delta"    : r.get("ce_delta"),    "pe_delta"    : r.get("pe_delta"),
+            "ce_gamma"    : r.get("ce_gamma"),    "pe_gamma"    : r.get("pe_gamma"),
+            "ce_theta"    : r.get("ce_theta"),    "pe_theta"    : r.get("pe_theta"),
+            "ce_vega"     : r.get("ce_vega"),     "pe_vega"     : r.get("pe_vega"),
+            "atm"         : r.get("atm", False),
+        } for r in snapshot["rows"]]
+
+        return jsonify({
+            "success"       : True,
+            "symbol"        : symbol,
+            "date"          : date,
+            "expiry"        : expiry,
+            "spot"          : snapshot["spot"],
+            "saved_at"      : snapshot["t"],
+            "reconstructed" : False,
+            "note"          : "Real Delta Exchange data captured and saved by TradePro for this specific expiry contract.",
+            "data"          : {"expiryData": rows, "atmIndex": len(rows) // 2},
+        })
+    except Exception as e:
+        logger.error(f"Delta option chain archive error: {e}")
+        return error(str(e), 400)
+
+
+@app.route("/api/delta/optionchain/archive/dates")
+def delta_option_chain_archive_dates():
+    symbol = request.args.get("symbol", "BTC").upper()
+    expiry = request.args.get("expiry", "") or None
+    ok, msg = _validate_delta_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    return jsonify({
+        "success": True, "symbol": symbol, "expiry": expiry,
+        "dates"  : chain_archive.list_available_dates(symbol, expiry),
+    })
+
+
+@app.route("/api/delta/optionchain/archive/expiries")
+def delta_option_chain_archive_expiries():
+    symbol = request.args.get("symbol", "BTC").upper()
+    date   = request.args.get("date", "")
+    ok, msg = _validate_delta_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    if date:
+        expiries = chain_archive.list_expiries_for_capture_date(symbol, date)
+    else:
+        expiries = chain_archive.list_expiries(symbol)
+    return jsonify({"success": True, "symbol": symbol, "date": date or None, "expiries": expiries})
+
+
+@app.route("/api/delta/optionchain/archive/times")
+def delta_option_chain_archive_times():
+    symbol = request.args.get("symbol", "BTC").upper()
+    date   = request.args.get("date", "")
+    expiry = request.args.get("expiry", "")
+    ok, msg = _validate_delta_symbol(symbol)
+    if not ok:
+        return error(msg, 400)
+    if not date or not expiry:
+        return error("date and expiry (YYYY-MM-DD) are required", 400)
+    return jsonify({
+        "success": True, "symbol": symbol, "date": date, "expiry": expiry,
+        "times"  : chain_archive.list_snapshot_times(symbol, expiry, date),
+    })
+
+# ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
 
@@ -588,9 +764,11 @@ def backtest_walkforward():
     option-chain snapshots (not Black-Scholes) starting from an entry point,
     applying SL/target rules against the actual premium changes that
     happened. Only works for dates/expiries TradePro has archived data for.
+    Works for NIFTY/BANKNIFTY as well as Delta Exchange BTC/ETH — just pass
+    "BTC" or "ETH" as symbol.
 
     Body:
-      symbol     : "NIFTY" | "BANKNIFTY"
+      symbol     : "NIFTY" | "BANKNIFTY" | "BTC" | "ETH"
       expiry     : contract expiry, YYYY-MM-DD
       entry_time : unix epoch seconds — the snapshot to enter at
       legs       : [{ "strike": 24300, "option_type": "CE"|"PE",
@@ -611,9 +789,12 @@ def backtest_walkforward():
         tgt_pct    = float(b.get("tgt_pct", 50))
         exit_time  = b.get("exit_time")
 
-        ok, msg = validate_symbol(symbol)
-        if not ok:
-            return error(msg, 400)
+        if symbol.upper() in delta_service.SUPPORTED_UNDERLYINGS:
+            symbol = symbol.upper()
+        else:
+            ok, msg = validate_symbol(symbol)
+            if not ok:
+                return error(msg, 400)
         if not expiry or not entry_time or not legs:
             return error("expiry, entry_time and legs are required", 400)
 
