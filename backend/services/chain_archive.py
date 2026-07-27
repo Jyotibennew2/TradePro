@@ -27,6 +27,11 @@ simulator queries. Crypto trades 24/7, so save_snapshot() accepts
 require_market_hours=False for those calls to skip the IST 9:15-15:30
 NSE-hours gate that only makes sense for NIFTY/BANKNIFTY.
 
+Also holds batch_results — the output table for the multi-scenario batch
+backtest engine (backend/services/batch_backtest.py), which replays many
+expiry x strike x timeframe x strategy combinations through
+simulate_legs_pnl() below and stores each result here for ranking.
+
 Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 """
 
@@ -419,3 +424,199 @@ def db_stats() -> dict:
     with _conn() as c:
         count = c.execute("SELECT COUNT(*) AS n FROM snapshots").fetchone()["n"]
     return {"rows": count, "size_bytes": size_bytes, "size_mb": round(size_bytes / 1_000_000, 2), "path": DB_PATH}
+
+
+# ---------------------------------------------------------------------------
+# Shared walk-forward PnL engine — used by BOTH the single-scenario
+# /api/backtest/walkforward endpoint AND the multi-scenario batch engine
+# (backend/services/batch_backtest.py), so both stay in sync and there's
+# only one place that implements "replay these legs through real archived
+# snapshots" logic.
+# ---------------------------------------------------------------------------
+
+def leg_price(snapshot: dict, strike: float, otype: str) -> float | None:
+    """LTP for one strike/side within an already-fetched snapshot dict, or None if missing."""
+    for r in snapshot["rows"]:
+        if r["strike"] == strike:
+            return r.get("ce_ltp") if otype == "CE" else r.get("pe_ltp")
+    return None
+
+
+def simulate_legs_pnl(symbol: str, expiry_date: str, entry_time: int, legs: list[dict],
+                       lot_size: int, sl_pct: float, tgt_pct: float, exit_time: int | None = None) -> dict | None:
+    """
+    Replay a multi-leg position forward through REAL archived snapshots
+    starting at entry_time, applying SL/target rules against actual premium
+    changes. Returns None if there isn't enough archived data to simulate
+    (e.g. a leg's strike was never captured, or no snapshots exist from
+    entry_time onward).
+
+    legs: [{ "strike": float, "option_type": "CE"|"PE", "action": "BUY"|"SELL", "lots": int }, ...]
+
+    Returns: {
+        entry_t, entry_spot, entry_premium_abs,
+        exit_t, exit_spot, exit_reason,
+        sl_amount, tgt_amount, final_pnl,
+        equity_curve: [{t, pnl, spot}, ...],
+        was_mock,
+    }
+    """
+    snapshots = list_snapshots_range(symbol, expiry_date, entry_time, exit_time)
+    if not snapshots:
+        return None
+
+    entry_snap = snapshots[0]
+    entry_prices: dict[int, float] = {}
+    entry_premium_abs = 0.0
+    for i, leg in enumerate(legs):
+        p = leg_price(entry_snap, leg["strike"], leg["option_type"])
+        if p is None:
+            return None
+        entry_prices[i] = p
+        qty = int(leg.get("lots", 1)) * lot_size
+        entry_premium_abs += p * qty
+
+    if entry_premium_abs <= 0:
+        return None
+
+    sl_amount  = entry_premium_abs * sl_pct  / 100
+    tgt_amount = entry_premium_abs * tgt_pct / 100
+
+    equity_curve  = []
+    exit_reason   = "data_ended"
+    exit_snap     = entry_snap
+    is_mock       = bool(entry_snap.get("mock", True))
+
+    for snap in snapshots:
+        pnl = 0.0
+        missing = False
+        for i, leg in enumerate(legs):
+            p = leg_price(snap, leg["strike"], leg["option_type"])
+            if p is None:
+                missing = True
+                break
+            qty  = int(leg.get("lots", 1)) * lot_size
+            sign = 1 if leg["action"] == "BUY" else -1
+            pnl += (p - entry_prices[i]) * qty * sign
+        if missing:
+            continue
+
+        equity_curve.append({"t": snap["t"], "pnl": round(pnl, 2), "spot": snap["spot"]})
+        exit_snap = snap
+
+        if pnl <= -sl_amount:
+            exit_reason = "SL Hit"
+            break
+        if pnl >= tgt_amount:
+            exit_reason = "Target Hit"
+            break
+
+    final_pnl = equity_curve[-1]["pnl"] if equity_curve else 0.0
+
+    return {
+        "entry_t"          : entry_snap["t"],
+        "entry_spot"       : entry_snap["spot"],
+        "entry_premium_abs": round(entry_premium_abs, 2),
+        "exit_t"           : exit_snap["t"],
+        "exit_spot"        : exit_snap["spot"],
+        "exit_reason"      : exit_reason,
+        "sl_amount"        : round(sl_amount, 2),
+        "tgt_amount"       : round(tgt_amount, 2),
+        "final_pnl"        : round(final_pnl, 2),
+        "equity_curve"     : equity_curve,
+        "was_mock"         : is_mock,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batch backtest results (multi-scenario: many expiries x strikes x
+# timeframes x strategies run in one go by backend/services/batch_backtest.py)
+# ---------------------------------------------------------------------------
+
+def _init_batch_table() -> None:
+    with _conn() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS batch_results (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id      TEXT    NOT NULL,   -- groups all rows from one /api/backtest/batch run
+                created_at    INTEGER NOT NULL,
+                symbol        TEXT    NOT NULL,
+                strategy      TEXT    NOT NULL,
+                expiry_date   TEXT    NOT NULL,
+                strike_offset INTEGER,            -- e.g. -2..+2 steps from ATM at entry
+                timeframe     TEXT,               -- entry-frequency label, e.g. "5m","15m","1h","1d"
+                entry_t       INTEGER,
+                exit_t        INTEGER,
+                exit_reason   TEXT,
+                pnl           REAL,
+                entry_premium REAL,
+                was_mock      INTEGER
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_batch ON batch_results (batch_id)")
+
+
+_init_batch_table()
+
+
+def save_batch_result(batch_id: str, symbol: str, strategy: str, expiry_date: str, strike_offset: int,
+                       timeframe: str, result: dict) -> None:
+    with _conn() as c:
+        c.execute("""
+            INSERT INTO batch_results
+                (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
+                 entry_t, exit_t, exit_reason, pnl, entry_premium, was_mock)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            batch_id, int(time.time()), symbol, strategy, expiry_date, strike_offset, timeframe,
+            result["entry_t"], result["exit_t"], result["exit_reason"],
+            result["final_pnl"], result["entry_premium_abs"], int(bool(result["was_mock"])),
+        ))
+
+
+def list_batch_ids(limit: int = 20) -> list[dict]:
+    """Recent batch runs with a quick summary each — for a history/picker UI."""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT batch_id, MIN(created_at) AS created_at, COUNT(*) AS n,
+                   SUM(pnl) AS total_pnl, AVG(pnl) AS avg_pnl,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
+            FROM batch_results GROUP BY batch_id ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_batch_results(batch_id: str) -> list[dict]:
+    """All individual scenario results for one batch run, ranked best PnL first."""
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT * FROM batch_results WHERE batch_id=? ORDER BY pnl DESC
+        """, (batch_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def summarize_batch(batch_id: str) -> dict:
+    """
+    Aggregate stats per (symbol, strategy) combo within a batch — win rate,
+    avg PnL, best/worst — so the best-performing scenario group stands out
+    without having to read hundreds of individual rows.
+    """
+    with _conn() as c:
+        rows = c.execute("""
+            SELECT symbol, strategy,
+                   COUNT(*) AS n,
+                   SUM(pnl) AS total_pnl,
+                   AVG(pnl) AS avg_pnl,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   MAX(pnl) AS best_pnl,
+                   MIN(pnl) AS worst_pnl
+            FROM batch_results WHERE batch_id=?
+            GROUP BY symbol, strategy
+            ORDER BY total_pnl DESC
+        """, (batch_id,)).fetchall()
+    groups = []
+    for r in rows:
+        d = dict(r)
+        d["win_rate"] = round(d["wins"] / d["n"] * 100, 1) if d["n"] else 0
+        groups.append(d)
+    return {"batch_id": batch_id, "groups": groups}
