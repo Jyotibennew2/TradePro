@@ -7,6 +7,8 @@ Compatible with Python 3.11+, Termux, Linux.
 import time
 import random
 import logging
+import threading
+import uuid
 from datetime import datetime
 
 from flask import Flask, jsonify, request
@@ -27,6 +29,7 @@ from backend.fyers_service      import FyersService
 from backend.services.market_data import MarketDataService
 from backend.services            import chain_archive
 from backend.services            import delta_service
+from backend.services            import batch_backtest
 from backend.greeks             import GreeksEngine
 from backend.strategy           import StrategyEngine
 from backend.scanner            import ScannerEngine
@@ -65,6 +68,13 @@ _market  = MarketDataService(_svc)
 
 register_middleware(app)
 register_error_handlers(app)
+
+# In-memory status tracker for background batch-backtest jobs (job_id ->
+# {"status": "running"|"done"|"error", "result": {...} or None, "error": str or None}).
+# Intentionally NOT persisted - if the server restarts mid-job, the job is
+# simply gone; the batch_results already SAVED to SQLite up to that point
+# remain queryable via /api/backtest/batch/results regardless.
+_batch_jobs: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # Scheduler tasks
@@ -778,6 +788,9 @@ def backtest_walkforward():
       sl_pct     : stop loss, % of entry premium (e.g. 50)
       tgt_pct    : target, % of entry premium (e.g. 50)
       exit_time  : optional unix epoch — hard cutoff even if SL/target not hit
+
+    Uses the shared chain_archive.simulate_legs_pnl() engine - the same one
+    the multi-scenario batch backtester (/api/backtest/batch) uses.
     """
     try:
         b          = request.json or {}
@@ -802,78 +815,118 @@ def backtest_walkforward():
         entry_time = int(entry_time)
         exit_time  = int(exit_time) if exit_time else None
 
-        snapshots = chain_archive.list_snapshots_range(symbol, expiry, entry_time, exit_time)
-        if not snapshots:
-            return error(f"No archived snapshots found for {symbol} exp={expiry} from that entry time onward", 404)
-
-        def leg_price(snapshot: dict, strike: float, otype: str) -> float | None:
-            for r in snapshot["rows"]:
-                if r["strike"] == strike:
-                    return r.get("ce_ltp") if otype == "CE" else r.get("pe_ltp")
-            return None
-
-        entry_snap = snapshots[0]
-        entry_prices: dict[int, float] = {}
-        entry_premium_abs = 0.0
-        for i, leg in enumerate(legs):
-            p = leg_price(entry_snap, leg["strike"], leg["option_type"])
-            if p is None:
-                return error(f"Strike {leg['strike']} {leg['option_type']} not found in entry snapshot (outside archived range)", 400)
-            entry_prices[i] = p
-            qty = int(leg.get("lots", 1)) * lot_size
-            entry_premium_abs += p * qty
-
-        sl_amount  = entry_premium_abs * sl_pct  / 100
-        tgt_amount = entry_premium_abs * tgt_pct / 100
-
-        equity_curve = []
-        exit_reason  = "data_ended"
-        exit_snap    = entry_snap
-        is_mock      = bool(entry_snap.get("mock", True))
-
-        for snap in snapshots:
-            pnl = 0.0
-            missing = False
-            for i, leg in enumerate(legs):
-                p = leg_price(snap, leg["strike"], leg["option_type"])
-                if p is None:
-                    missing = True
-                    break
-                qty  = int(leg.get("lots", 1)) * lot_size
-                sign = 1 if leg["action"] == "BUY" else -1
-                pnl += (p - entry_prices[i]) * qty * sign
-            if missing:
-                continue
-
-            equity_curve.append({"t": snap["t"], "pnl": round(pnl, 2), "spot": snap["spot"]})
-            exit_snap = snap
-
-            if pnl <= -sl_amount:
-                exit_reason = "SL Hit"
-                break
-            if pnl >= tgt_amount:
-                exit_reason = "Target Hit"
-                break
-
-        final_pnl = equity_curve[-1]["pnl"] if equity_curve else 0.0
+        result = chain_archive.simulate_legs_pnl(symbol, expiry, entry_time, legs, lot_size, sl_pct, tgt_pct, exit_time)
+        if not result:
+            return error(f"No archived data available to simulate this trade for {symbol} exp={expiry} from that entry time", 404)
 
         return jsonify({
-            "success"          : True,
-            "symbol"           : symbol,
-            "expiry"           : expiry,
-            "was_mock"         : is_mock,
-            "entry"            : {"t": entry_snap["t"], "spot": entry_snap["spot"], "premium_abs": round(entry_premium_abs, 2)},
-            "exit"             : {"t": exit_snap["t"], "spot": exit_snap["spot"], "reason": exit_reason},
-            "sl_amount"        : round(sl_amount, 2),
-            "tgt_amount"       : round(tgt_amount, 2),
-            "final_pnl"        : round(final_pnl, 2),
-            "equity_curve"     : equity_curve,
-            "snapshots_used"   : len(equity_curve),
-            "note"             : "Walk-forward: entry/exit premiums are real archived LTPs for these exact strikes, not simulated.",
+            "success"        : True,
+            "symbol"         : symbol,
+            "expiry"         : expiry,
+            "was_mock"       : result["was_mock"],
+            "entry"          : {"t": result["entry_t"], "spot": result["entry_spot"], "premium_abs": result["entry_premium_abs"]},
+            "exit"           : {"t": result["exit_t"], "spot": result["exit_spot"], "reason": result["exit_reason"]},
+            "sl_amount"      : result["sl_amount"],
+            "tgt_amount"     : result["tgt_amount"],
+            "final_pnl"      : result["final_pnl"],
+            "equity_curve"   : result["equity_curve"],
+            "snapshots_used" : len(result["equity_curve"]),
+            "note"           : "Walk-forward: entry/exit premiums are real archived LTPs for these exact strikes, not simulated.",
         })
     except Exception as e:
         logger.error(f"Walk-forward backtest error: {e}")
         return error(str(e), 400)
+
+# ---------------------------------------------------------------------------
+# Multi-scenario Batch Backtest — many expiries x strikes x timeframes x
+# strategies (incl. Greeks-driven Delta-Neutral / Theta-Harvest) in one run
+# ---------------------------------------------------------------------------
+
+@app.route("/api/backtest/batch", methods=["POST"])
+def backtest_batch():
+    """
+    Kicks off a batch backtest across every combination of the given
+    symbols x strategies x strike_offsets x timeframes, using ALL archived
+    expiries for each symbol. Runs in a background thread (this can process
+    hundreds of scenarios, which would otherwise block the request for a
+    long time) - poll /api/backtest/batch/status/<job_id> for progress,
+    then /api/backtest/batch/results?batch_id=... once done.
+
+    Body (all optional except symbols):
+      symbols        : ["NIFTY","BANKNIFTY","BTC","ETH"]
+      strategies     : subset of ["straddle","strangle","iron_condor","delta_neutral","theta_harvest"]
+                       (default: all five)
+      strike_offsets : e.g. [0,1,2]  (default: [0,1,2])
+      timeframes     : subset of ["5m","15m","1h","1d"]  (default: all four)
+      sl_pct         : stop loss %, default 50
+      tgt_pct        : target %, default 50
+      lots           : lots per leg, default 1
+      max_entries_per_expiry : cap entry points tried per (expiry,timeframe), default 20
+    """
+    try:
+        b = request.json or {}
+        symbols = b.get("symbols", [])
+        if not symbols:
+            return error("symbols is required, e.g. [\"NIFTY\",\"BTC\"]", 400)
+
+        job_id = f"job_{uuid.uuid4().hex[:10]}"
+        _batch_jobs[job_id] = {"status": "running", "result": None, "error": None}
+
+        def _run():
+            try:
+                result = batch_backtest.run_batch(
+                    symbols                = [s.upper() for s in symbols],
+                    strategies             = b.get("strategies"),
+                    strike_offsets         = b.get("strike_offsets"),
+                    timeframes             = b.get("timeframes"),
+                    sl_pct                 = float(b.get("sl_pct", 50)),
+                    tgt_pct                = float(b.get("tgt_pct", 50)),
+                    lots                   = int(b.get("lots", 1)),
+                    max_entries_per_expiry = int(b.get("max_entries_per_expiry", 20)),
+                )
+                _batch_jobs[job_id] = {"status": "done", "result": result, "error": None}
+            except Exception as e:
+                logger.error(f"Batch backtest job {job_id} failed: {e}")
+                _batch_jobs[job_id] = {"status": "error", "result": None, "error": str(e)}
+
+        threading.Thread(target=_run, daemon=True).start()
+
+        return jsonify({
+            "success": True, "job_id": job_id, "status": "running",
+            "note"   : "Running in background. Poll /api/backtest/batch/status/<job_id> for progress.",
+        })
+    except Exception as e:
+        logger.error(f"Batch backtest trigger error: {e}")
+        return error(str(e), 400)
+
+
+@app.route("/api/backtest/batch/status/<job_id>")
+def backtest_batch_status(job_id):
+    job = _batch_jobs.get(job_id)
+    if not job:
+        return error(f"Unknown job_id: {job_id}", 404)
+    return jsonify({"success": True, "job_id": job_id, **job})
+
+
+@app.route("/api/backtest/batch/list")
+def backtest_batch_list():
+    """Recent batch runs (from SQLite - survives server restarts, unlike the in-memory job tracker above)."""
+    limit = int(request.args.get("limit", 20))
+    return jsonify({"success": True, "batches": chain_archive.list_batch_ids(limit)})
+
+
+@app.route("/api/backtest/batch/results")
+def backtest_batch_results():
+    """
+    Full ranked results for one batch run. Pass `summary=true` for the
+    grouped (symbol,strategy) aggregate view instead of every individual row.
+    """
+    batch_id = request.args.get("batch_id", "")
+    if not batch_id:
+        return error("batch_id is required", 400)
+    if request.args.get("summary", "").lower() == "true":
+        return jsonify({"success": True, **chain_archive.summarize_batch(batch_id)})
+    return jsonify({"success": True, "batch_id": batch_id, "results": chain_archive.get_batch_results(batch_id)})
 
 # ===========================================================================
 # NEW APIs — Sprint 3
