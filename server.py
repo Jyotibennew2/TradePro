@@ -918,15 +918,32 @@ def backtest_batch_list():
 @app.route("/api/backtest/batch/results")
 def backtest_batch_results():
     """
-    Full ranked results for one batch run. Pass `summary=true` for the
-    grouped (symbol,strategy) aggregate view instead of every individual row.
+    Full ranked results for one batch run — each includes the exact legs
+    traded (strike, CE/PE, BUY/SELL, lots), the SL/target amounts applied,
+    entry/exit spot, and exit reason, so every result can be fully explained
+    (not just its final PnL). Pass `summary=true` for the grouped
+    (symbol,strategy) aggregate view instead.
+
+    Query params:
+      batch_id  - required
+      summary   - "true" for the grouped aggregate view
+      symbol    - optional filter, e.g. drill into one group from the summary
+      strategy  - optional filter, e.g. "theta_harvest"
+      limit     - max individual rows to return (default 500)
     """
     batch_id = request.args.get("batch_id", "")
     if not batch_id:
         return error("batch_id is required", 400)
     if request.args.get("summary", "").lower() == "true":
         return jsonify({"success": True, **chain_archive.summarize_batch(batch_id)})
-    return jsonify({"success": True, "batch_id": batch_id, "results": chain_archive.get_batch_results(batch_id)})
+
+    symbol   = request.args.get("symbol") or None
+    strategy = request.args.get("strategy") or None
+    limit    = int(request.args.get("limit", 500))
+    return jsonify({
+        "success": True, "batch_id": batch_id,
+        "results": chain_archive.get_batch_results(batch_id, symbol, strategy, limit),
+    })
 
 # ===========================================================================
 # NEW APIs — Sprint 3
