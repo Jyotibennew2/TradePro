@@ -31,7 +31,9 @@ Also holds batch_results — the output table for the multi-scenario batch
 backtest engine (backend/services/batch_backtest.py), which replays many
 expiry x strike x timeframe x strategy combinations through
 simulate_legs_pnl_from_snapshots() below and stores each result here for
-ranking.
+ranking. Each row stores the FULL legs detail (exact strikes, CE/PE,
+BUY/SELL, lots) plus the SL/target amounts that were applied, so every
+result can be fully explained later - not just its final PnL.
 
 Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 """
@@ -39,6 +41,7 @@ Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 import os
 import sqlite3
 import time
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 
@@ -555,6 +558,13 @@ def simulate_legs_pnl(symbol: str, expiry_date: str, entry_time: int, legs: list
 # ---------------------------------------------------------------------------
 # Batch backtest results (multi-scenario: many expiries x strikes x
 # timeframes x strategies run in one go by backend/services/batch_backtest.py)
+#
+# Every row stores the FULL detail of what was tested and how, not just the
+# outcome: exact legs (strike, CE/PE, BUY/SELL, lots) as JSON, plus the
+# SL/target rupee amounts that were actually applied for that trade's entry
+# premium — so any result can be fully explained later ("why did this win/
+# lose", "what strike was this", "how much was the stop-loss") without
+# having to guess or re-derive it.
 # ---------------------------------------------------------------------------
 
 def _init_batch_table() -> None:
@@ -567,52 +577,59 @@ def _init_batch_table() -> None:
                 symbol        TEXT    NOT NULL,
                 strategy      TEXT    NOT NULL,
                 expiry_date   TEXT    NOT NULL,
-                strike_offset INTEGER,            -- e.g. -2..+2 steps from ATM at entry
+                strike_offset INTEGER,            -- e.g. 0..2 steps from ATM at entry (fixed-width strategies)
                 timeframe     TEXT,               -- entry-frequency label, e.g. "5m","15m","1h","1d"
+                legs_json     TEXT,               -- [{strike, option_type, action, lots}, ...] - the EXACT legs traded
+                entry_spot    REAL,
+                entry_premium REAL,               -- total premium collected/paid at entry (all legs, all lots)
+                sl_amount     REAL,               -- rupee/dollar SL that was applied (sl_pct % of entry_premium)
+                tgt_amount    REAL,               -- rupee/dollar target that was applied
                 entry_t       INTEGER,
                 exit_t        INTEGER,
-                exit_reason   TEXT,
+                exit_spot     REAL,
+                exit_reason   TEXT,               -- "SL Hit" | "Target Hit" | "data_ended"
                 pnl           REAL,
-                entry_premium REAL,
                 was_mock      INTEGER
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_batch ON batch_results (batch_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_batch_group ON batch_results (batch_id, symbol, strategy)")
+        # Migration: add columns missing from an older DB (safe no-op if already present)
+        existing = {row["name"] for row in c.execute("PRAGMA table_info(batch_results)")}
+        for col, coltype in [("legs_json", "TEXT"), ("entry_spot", "REAL"),
+                              ("sl_amount", "REAL"), ("tgt_amount", "REAL"), ("exit_spot", "REAL")]:
+            if col not in existing:
+                try:
+                    c.execute(f"ALTER TABLE batch_results ADD COLUMN {col} {coltype}")
+                except sqlite3.OperationalError:
+                    pass
 
 
 _init_batch_table()
 
 
-def save_batch_result(batch_id: str, symbol: str, strategy: str, expiry_date: str, strike_offset: int,
-                       timeframe: str, result: dict) -> None:
-    with _conn() as c:
-        c.execute("""
-            INSERT INTO batch_results
-                (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
-                 entry_t, exit_t, exit_reason, pnl, entry_premium, was_mock)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            batch_id, int(time.time()), symbol, strategy, expiry_date, strike_offset, timeframe,
-            result["entry_t"], result["exit_t"], result["exit_reason"],
-            result["final_pnl"], result["entry_premium_abs"], int(bool(result["was_mock"])),
-        ))
-
-
 def save_batch_results_bulk(batch_id: str, rows: list[tuple]) -> None:
     """
-    Bulk-insert version of save_batch_result() for the batch engine - one
-    executemany() call for hundreds/thousands of rows instead of one INSERT
-    (and one transaction commit) per result, which is the third big cost
-    driver in a large batch run on slower storage (phone flash).
+    Bulk-insert results for the batch engine - one executemany() call for
+    hundreds/thousands of rows instead of one INSERT (and commit) per
+    result, which is a big cost driver in a large batch run on slower
+    storage (phone flash).
 
-    rows: list of (symbol, strategy, expiry_date, strike_offset, timeframe, result_dict)
+    rows: list of (symbol, strategy, expiry_date, strike_offset, timeframe,
+                    legs, result_dict)
+          where `legs` is the exact leg list passed to
+          simulate_legs_pnl_from_snapshots() - [{strike, option_type,
+          action, lots}, ...] - stored as JSON so every trade's exact
+          strikes/direction can be inspected later.
     """
     created_at = int(time.time())
     values = [
         (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
-         result["entry_t"], result["exit_t"], result["exit_reason"],
-         result["final_pnl"], result["entry_premium_abs"], int(bool(result["was_mock"])))
-        for (symbol, strategy, expiry_date, strike_offset, timeframe, result) in rows
+         json.dumps(legs), result["entry_spot"], result["entry_premium_abs"],
+         result["sl_amount"], result["tgt_amount"],
+         result["entry_t"], result["exit_t"], result["exit_spot"], result["exit_reason"],
+         result["final_pnl"], int(bool(result["was_mock"])))
+        for (symbol, strategy, expiry_date, strike_offset, timeframe, legs, result) in rows
     ]
     if not values:
         return
@@ -620,8 +637,9 @@ def save_batch_results_bulk(batch_id: str, rows: list[tuple]) -> None:
         c.executemany("""
             INSERT INTO batch_results
                 (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
-                 entry_t, exit_t, exit_reason, pnl, entry_premium, was_mock)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 legs_json, entry_spot, entry_premium, sl_amount, tgt_amount,
+                 entry_t, exit_t, exit_spot, exit_reason, pnl, was_mock)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, values)
 
 
@@ -637,20 +655,48 @@ def list_batch_ids(limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def get_batch_results(batch_id: str) -> list[dict]:
-    """All individual scenario results for one batch run, ranked best PnL first."""
+def _row_with_parsed_legs(r: sqlite3.Row) -> dict:
+    d = dict(r)
+    try:
+        d["legs"] = json.loads(d.get("legs_json") or "[]")
+    except (TypeError, ValueError):
+        d["legs"] = []
+    return d
+
+
+def get_batch_results(batch_id: str, symbol: str | None = None, strategy: str | None = None,
+                       limit: int = 500) -> list[dict]:
+    """
+    Individual scenario results for one batch run, ranked best PnL first,
+    each including the exact `legs` (strike/CE-PE/BUY-SELL/lots) that were
+    traded, the SL/target amounts applied, and the entry/exit reason -
+    everything needed to fully explain a single result.
+
+    Pass symbol/strategy to drill into one group from the summary view
+    (e.g. the row the user tapped on) instead of the whole batch.
+    """
     with _conn() as c:
-        rows = c.execute("""
-            SELECT * FROM batch_results WHERE batch_id=? ORDER BY pnl DESC
-        """, (batch_id,)).fetchall()
-    return [dict(r) for r in rows]
+        query = "SELECT * FROM batch_results WHERE batch_id=?"
+        params: list = [batch_id]
+        if symbol:
+            query += " AND symbol=?"
+            params.append(symbol)
+        if strategy:
+            query += " AND strategy=?"
+            params.append(strategy)
+        query += " ORDER BY pnl DESC LIMIT ?"
+        params.append(limit)
+        rows = c.execute(query, params).fetchall()
+    return [_row_with_parsed_legs(r) for r in rows]
 
 
 def summarize_batch(batch_id: str) -> dict:
     """
     Aggregate stats per (symbol, strategy) combo within a batch — win rate,
     avg PnL, best/worst — so the best-performing scenario group stands out
-    without having to read hundreds of individual rows.
+    without having to read hundreds of individual rows. Use
+    get_batch_results(batch_id, symbol, strategy) to drill into one group's
+    individual trades (exact strikes, buy/sell, SL amounts).
     """
     with _conn() as c:
         rows = c.execute("""
