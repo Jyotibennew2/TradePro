@@ -4,13 +4,18 @@ TradePro Backend - Multi-scenario Batch Backtest Engine
 Runs MANY backtest scenarios in one call - across expiries, strikes,
 timeframes (entry frequency), and strategies - including Greeks-driven ones
 that use the REAL archived delta/theta values at entry time (not just fixed
-strike offsets) - and stores every result via chain_archive.save_batch_result()
-so they can be ranked afterward (best PnL / win-rate first).
+strike offsets) - and stores every result via
+chain_archive.save_batch_results_bulk() so they can be ranked afterward
+(best PnL / win-rate first).
 
-Reuses chain_archive.simulate_legs_pnl() for the actual PnL replay, so this
-file is only about GENERATING scenario combinations and SELECTING legs - it
-does not re-implement the walk-forward math (that lives in one place only,
-shared with the single-scenario /api/backtest/walkforward endpoint).
+PERFORMANCE: for a given (symbol, expiry_date, entry_time), the archived
+snapshot series is fetched from SQLite exactly ONCE and reused across every
+strategy x strike_offset combination tested at that entry point (via
+chain_archive.simulate_legs_pnl_from_snapshots()) - re-fetching per
+combination was the biggest cost driver in earlier runs, since a single
+entry point might get tested by 5 strategies x 3 offsets = 15 combos.
+Results are also bulk-inserted per entry point instead of one INSERT per
+scenario.
 
 STRATEGIES:
   straddle       - sell ATM (+ offset) call and put
@@ -142,15 +147,15 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
               sl_pct: float = 50, tgt_pct: float = 50, lots: int = 1,
               max_entries_per_expiry: int = 20) -> dict:
     """
-    Main entry point: loops symbol x expiry x timeframe x strike_offset x
-    strategy, builds legs off the REAL entry snapshot for that combo, runs
-    chain_archive.simulate_legs_pnl(), and saves every result. Returns a
-    summary + batch_id so the caller can fetch full/ranked results after.
+    Main entry point: loops symbol x expiry x timeframe x entry-point, and
+    for EACH entry point fetches the archived snapshot series ONCE, then
+    tries every strategy x strike_offset combo against that same fetched
+    series (via simulate_legs_pnl_from_snapshots - no further DB reads).
+    Results for the whole batch are bulk-inserted at the end.
 
     max_entries_per_expiry caps how many entry points are tried per
     (expiry, timeframe) pair - keeps a single call bounded even if months
-    of 5-min data are archived. Increase it once you've confirmed the
-    smaller run behaves as expected.
+    of 5-min data are archived.
     """
     strategies     = strategies or list(STRATEGIES)
     strike_offsets = strike_offsets if strike_offsets is not None else list(STRIKE_OFFSETS)
@@ -158,6 +163,7 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
 
     batch_id = f"batch_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     total_run = total_saved = total_skipped = 0
+    pending_rows: list[tuple] = []   # accumulated for one bulk insert per expiry
 
     for symbol in symbols:
         lot_size = DEFAULT_LOT_SIZES.get(symbol.upper(), 1)
@@ -182,10 +188,12 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
                 entries = entries[:max_entries_per_expiry]
 
                 for entry_t in entries:
-                    capture_date = datetime.fromtimestamp(entry_t, IST).strftime("%Y-%m-%d")
-                    entry_snap = chain_archive.nearest_snapshot(symbol, expiry_date, capture_date, entry_t)
-                    if not entry_snap:
+                    # Fetch the archived series for this entry point ONCE -
+                    # reused below for every strategy x offset combo.
+                    snapshots = chain_archive.list_snapshots_range(symbol, expiry_date, entry_t)
+                    if not snapshots:
                         continue
+                    entry_snap = snapshots[0]
 
                     for strategy in strategies:
                         for offset in strike_offsets:
@@ -194,16 +202,24 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
                             if not legs:
                                 total_skipped += 1
                                 continue
-                            result = chain_archive.simulate_legs_pnl(
-                                symbol, expiry_date, entry_t, legs, lot_size, sl_pct, tgt_pct
+                            result = chain_archive.simulate_legs_pnl_from_snapshots(
+                                snapshots, legs, lot_size, sl_pct, tgt_pct
                             )
                             if not result:
                                 total_skipped += 1
                                 continue
-                            chain_archive.save_batch_result(
-                                batch_id, symbol, strategy, expiry_date, offset, tf_label, result
-                            )
+                            pending_rows.append((symbol, strategy, expiry_date, offset, tf_label, result))
                             total_saved += 1
+
+                            # Flush periodically so a long-running batch still has
+                            # partial results visible (and progress-queryable) before
+                            # the whole thing finishes, without doing one INSERT per row.
+                            if len(pending_rows) >= 200:
+                                chain_archive.save_batch_results_bulk(batch_id, pending_rows)
+                                pending_rows = []
+
+    if pending_rows:
+        chain_archive.save_batch_results_bulk(batch_id, pending_rows)
 
     logger.info(f"Batch {batch_id}: {total_saved} saved / {total_run} attempted ({total_skipped} skipped)")
     return {
