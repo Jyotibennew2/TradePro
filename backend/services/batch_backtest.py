@@ -6,7 +6,8 @@ timeframes (entry frequency), and strategies - including Greeks-driven ones
 that use the REAL archived delta/theta values at entry time (not just fixed
 strike offsets) - and stores every result via
 chain_archive.save_batch_results_bulk() so they can be ranked afterward
-(best PnL / win-rate first).
+(best PnL / win-rate first) AND fully explained later (exact strikes,
+buy/sell, SL amount - see chain_archive.get_batch_results()).
 
 PERFORMANCE: for a given (symbol, expiry_date, entry_time), the archived
 snapshot series is fetched from SQLite exactly ONCE and reused across every
@@ -151,7 +152,10 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
     for EACH entry point fetches the archived snapshot series ONCE, then
     tries every strategy x strike_offset combo against that same fetched
     series (via simulate_legs_pnl_from_snapshots - no further DB reads).
-    Results for the whole batch are bulk-inserted at the end.
+    Every result is saved WITH its exact legs (strikes/CE-PE/BUY-SELL) and
+    the SL/target amounts that were applied, so it can be fully explained
+    later via chain_archive.get_batch_results(). Results for the whole
+    batch are bulk-inserted.
 
     max_entries_per_expiry caps how many entry points are tried per
     (expiry, timeframe) pair - keeps a single call bounded even if months
@@ -163,7 +167,7 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
 
     batch_id = f"batch_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     total_run = total_saved = total_skipped = 0
-    pending_rows: list[tuple] = []   # accumulated for one bulk insert per expiry
+    pending_rows: list[tuple] = []   # accumulated for one bulk insert per flush
 
     for symbol in symbols:
         lot_size = DEFAULT_LOT_SIZES.get(symbol.upper(), 1)
@@ -208,7 +212,7 @@ def run_batch(symbols: list[str], strategies: list[str] | None = None,
                             if not result:
                                 total_skipped += 1
                                 continue
-                            pending_rows.append((symbol, strategy, expiry_date, offset, tf_label, result))
+                            pending_rows.append((symbol, strategy, expiry_date, offset, tf_label, legs, result))
                             total_saved += 1
 
                             # Flush periodically so a long-running batch still has
