@@ -30,7 +30,8 @@ NSE-hours gate that only makes sense for NIFTY/BANKNIFTY.
 Also holds batch_results — the output table for the multi-scenario batch
 backtest engine (backend/services/batch_backtest.py), which replays many
 expiry x strike x timeframe x strategy combinations through
-simulate_legs_pnl() below and stores each result here for ranking.
+simulate_legs_pnl_from_snapshots() below and stores each result here for
+ranking.
 
 Compatible with Python 3.11+, Termux, Linux. Stdlib only (sqlite3).
 """
@@ -389,6 +390,11 @@ def list_snapshots_range(symbol: str, expiry_date: str, from_epoch: int, to_epoc
     that spans, ordered by time. Used by the walk-forward backtest engine
     to replay a trade's entire holding period using real captured LTPs
     (not a Black-Scholes simulation).
+
+    Batch-engine callers: fetch this ONCE per (symbol, expiry_date,
+    entry_time) and reuse the result across every strategy/strike-offset
+    combo tested at that entry point via simulate_legs_pnl_from_snapshots()
+    - re-fetching per combo is the #1 cost driver in a large batch run.
     """
     with _conn() as c:
         if to_epoch is None:
@@ -405,14 +411,27 @@ def list_snapshots_range(symbol: str, expiry_date: str, from_epoch: int, to_epoc
             """, (symbol, expiry_date, from_epoch, to_epoch)).fetchall()
         times = [r["captured_at"] for r in rows]
 
+        if not times:
+            return []
+
+        # Fetch ALL rows for the whole time range in ONE query instead of one
+        # query per timestamp - this is the other big cost driver for a wide
+        # entry-to-expiry range (previously N+1: one query just to list the
+        # distinct timestamps, then one more per timestamp).
+        placeholders = ",".join("?" * len(times))
+        all_rows = c.execute(f"""
+            SELECT * FROM snapshots
+            WHERE symbol=? AND expiry_date=? AND captured_at IN ({placeholders})
+            ORDER BY captured_at, strike
+        """, (symbol, expiry_date, *times)).fetchall()
+
+        grouped: dict[int, list] = {}
+        for r in all_rows:
+            grouped.setdefault(r["captured_at"], []).append(r)
+
         snapshots = []
         for t in times:
-            db_rows = c.execute("""
-                SELECT * FROM snapshots
-                WHERE symbol=? AND expiry_date=? AND captured_at=?
-                ORDER BY strike
-            """, (symbol, expiry_date, t)).fetchall()
-            snap = _rows_to_snapshot(db_rows)
+            snap = _rows_to_snapshot(grouped.get(t, []))
             if snap:
                 snapshots.append(snap)
         return snapshots
@@ -442,26 +461,17 @@ def leg_price(snapshot: dict, strike: float, otype: str) -> float | None:
     return None
 
 
-def simulate_legs_pnl(symbol: str, expiry_date: str, entry_time: int, legs: list[dict],
-                       lot_size: int, sl_pct: float, tgt_pct: float, exit_time: int | None = None) -> dict | None:
+def simulate_legs_pnl_from_snapshots(snapshots: list[dict], legs: list[dict],
+                                      lot_size: int, sl_pct: float, tgt_pct: float) -> dict | None:
     """
-    Replay a multi-leg position forward through REAL archived snapshots
-    starting at entry_time, applying SL/target rules against actual premium
-    changes. Returns None if there isn't enough archived data to simulate
-    (e.g. a leg's strike was never captured, or no snapshots exist from
-    entry_time onward).
-
-    legs: [{ "strike": float, "option_type": "CE"|"PE", "action": "BUY"|"SELL", "lots": int }, ...]
-
-    Returns: {
-        entry_t, entry_spot, entry_premium_abs,
-        exit_t, exit_spot, exit_reason,
-        sl_amount, tgt_amount, final_pnl,
-        equity_curve: [{t, pnl, spot}, ...],
-        was_mock,
-    }
+    Pure computation - no database access. Replays `legs` forward through an
+    ALREADY-FETCHED list of snapshots (snapshots[0] is treated as the entry
+    point). Pulling this out of simulate_legs_pnl() lets the batch engine
+    fetch a given (symbol, expiry, entry_time) snapshot series ONCE and
+    reuse it across every strategy/strike-offset combination tested at that
+    entry point, instead of re-querying the database for each one - this is
+    the single biggest speedup for a large batch run.
     """
-    snapshots = list_snapshots_range(symbol, expiry_date, entry_time, exit_time)
     if not snapshots:
         return None
 
@@ -528,6 +538,20 @@ def simulate_legs_pnl(symbol: str, expiry_date: str, entry_time: int, legs: list
     }
 
 
+def simulate_legs_pnl(symbol: str, expiry_date: str, entry_time: int, legs: list[dict],
+                       lot_size: int, sl_pct: float, tgt_pct: float, exit_time: int | None = None) -> dict | None:
+    """
+    Convenience wrapper for single-scenario callers (the /api/backtest/walkforward
+    endpoint): fetches the snapshot series from SQLite, then delegates to
+    simulate_legs_pnl_from_snapshots() for the actual replay math. The batch
+    engine calls list_snapshots_range() + simulate_legs_pnl_from_snapshots()
+    directly instead, so it can reuse one fetched series across many legs
+    combinations - see backend/services/batch_backtest.py.
+    """
+    snapshots = list_snapshots_range(symbol, expiry_date, entry_time, exit_time)
+    return simulate_legs_pnl_from_snapshots(snapshots, legs, lot_size, sl_pct, tgt_pct)
+
+
 # ---------------------------------------------------------------------------
 # Batch backtest results (multi-scenario: many expiries x strikes x
 # timeframes x strategies run in one go by backend/services/batch_backtest.py)
@@ -572,6 +596,33 @@ def save_batch_result(batch_id: str, symbol: str, strategy: str, expiry_date: st
             result["entry_t"], result["exit_t"], result["exit_reason"],
             result["final_pnl"], result["entry_premium_abs"], int(bool(result["was_mock"])),
         ))
+
+
+def save_batch_results_bulk(batch_id: str, rows: list[tuple]) -> None:
+    """
+    Bulk-insert version of save_batch_result() for the batch engine - one
+    executemany() call for hundreds/thousands of rows instead of one INSERT
+    (and one transaction commit) per result, which is the third big cost
+    driver in a large batch run on slower storage (phone flash).
+
+    rows: list of (symbol, strategy, expiry_date, strike_offset, timeframe, result_dict)
+    """
+    created_at = int(time.time())
+    values = [
+        (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
+         result["entry_t"], result["exit_t"], result["exit_reason"],
+         result["final_pnl"], result["entry_premium_abs"], int(bool(result["was_mock"])))
+        for (symbol, strategy, expiry_date, strike_offset, timeframe, result) in rows
+    ]
+    if not values:
+        return
+    with _conn() as c:
+        c.executemany("""
+            INSERT INTO batch_results
+                (batch_id, created_at, symbol, strategy, expiry_date, strike_offset, timeframe,
+                 entry_t, exit_t, exit_reason, pnl, entry_premium, was_mock)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, values)
 
 
 def list_batch_ids(limit: int = 20) -> list[dict]:
