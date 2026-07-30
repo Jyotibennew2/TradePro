@@ -690,6 +690,18 @@ def get_batch_results(batch_id: str, symbol: str | None = None, strategy: str | 
     return [_row_with_parsed_legs(r) for r in rows]
 
 
+def delete_batch(batch_id: str) -> int:
+    """
+    Delete every row belonging to one batch run. Returns how many rows were
+    removed (0 if the batch_id didn't exist) - used by the "delete" button
+    in the batch-backtest history list so junk/test runs can be cleared
+    while keeping the useful ones.
+    """
+    with _conn() as c:
+        cur = c.execute("DELETE FROM batch_results WHERE batch_id=?", (batch_id,))
+        return cur.rowcount
+
+
 def summarize_batch(batch_id: str) -> dict:
     """
     Aggregate stats per (symbol, strategy) combo within a batch — win rate,
