@@ -945,6 +945,18 @@ def backtest_batch_results():
         "results": chain_archive.get_batch_results(batch_id, symbol, strategy, limit),
     })
 
+
+@app.route("/api/backtest/batch/<batch_id>", methods=["DELETE"])
+def backtest_batch_delete(batch_id):
+    """
+    Deletes ALL rows for one batch run - lets the user keep useful batches
+    and clear out junk/test runs from the history list. Cannot be undone.
+    """
+    deleted = chain_archive.delete_batch(batch_id)
+    if deleted == 0:
+        return error(f"No batch found with id {batch_id}", 404)
+    return jsonify({"success": True, "batch_id": batch_id, "deleted_rows": deleted})
+
 # ===========================================================================
 # NEW APIs — Sprint 3
 # ===========================================================================
