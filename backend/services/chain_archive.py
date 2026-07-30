@@ -690,15 +690,28 @@ def get_batch_results(batch_id: str, symbol: str | None = None, strategy: str | 
     return [_row_with_parsed_legs(r) for r in rows]
 
 
-def delete_batch(batch_id: str) -> int:
+def delete_batch(batch_id: str, symbol: str | None = None, strategy: str | None = None) -> int:
     """
-    Delete every row belonging to one batch run. Returns how many rows were
-    removed (0 if the batch_id didn't exist) - used by the "delete" button
-    in the batch-backtest history list so junk/test runs can be cleared
-    while keeping the useful ones.
+    Delete rows belonging to one batch run. Returns how many rows were
+    removed (0 if nothing matched).
+
+    - delete_batch(batch_id): removes the ENTIRE batch (all symbols/strategies).
+    - delete_batch(batch_id, symbol=..., strategy=...): removes just that one
+      (symbol, strategy) group within the batch, leaving the rest of the
+      batch's results intact - used by the per-strategy delete button so a
+      user can drop just e.g. "straddle" results from a batch while keeping
+      "theta_harvest" etc.
     """
+    query = "DELETE FROM batch_results WHERE batch_id=?"
+    params: list = [batch_id]
+    if symbol:
+        query += " AND symbol=?"
+        params.append(symbol)
+    if strategy:
+        query += " AND strategy=?"
+        params.append(strategy)
     with _conn() as c:
-        cur = c.execute("DELETE FROM batch_results WHERE batch_id=?", (batch_id,))
+        cur = c.execute(query, params)
         return cur.rowcount
 
 
