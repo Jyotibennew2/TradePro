@@ -949,13 +949,25 @@ def backtest_batch_results():
 @app.route("/api/backtest/batch/<batch_id>", methods=["DELETE"])
 def backtest_batch_delete(batch_id):
     """
-    Deletes ALL rows for one batch run - lets the user keep useful batches
-    and clear out junk/test runs from the history list. Cannot be undone.
+    Deletes rows for one batch run - lets the user keep useful batches and
+    clear out junk/test runs. Cannot be undone.
+
+    - No query params: deletes the ENTIRE batch (every symbol/strategy).
+    - ?symbol=X&strategy=Y: deletes just that one group within the batch
+      (e.g. drop "straddle" results but keep "theta_harvest" etc.), leaving
+      the rest of the batch intact.
     """
-    deleted = chain_archive.delete_batch(batch_id)
+    symbol   = request.args.get("symbol") or None
+    strategy = request.args.get("strategy") or None
+    deleted  = chain_archive.delete_batch(batch_id, symbol, strategy)
     if deleted == 0:
-        return error(f"No batch found with id {batch_id}", 404)
-    return jsonify({"success": True, "batch_id": batch_id, "deleted_rows": deleted})
+        return error(f"No matching rows found for batch {batch_id}"
+                      + (f" symbol={symbol}" if symbol else "")
+                      + (f" strategy={strategy}" if strategy else ""), 404)
+    return jsonify({
+        "success": True, "batch_id": batch_id, "symbol": symbol, "strategy": strategy,
+        "deleted_rows": deleted,
+    })
 
 # ===========================================================================
 # NEW APIs — Sprint 3
