@@ -16,9 +16,13 @@ fyers-apiv3>=3.1,<4.0
 requests>=2.31,<3.0
 
 # --- API documentation (Swagger/OpenAPI) ---
-# MIT license. Auto-generates /apidocs from Flask route docstrings -
-# no manual OpenAPI YAML to maintain.
-flasgger>=0.9.7,<1.0
+# MIT license. flask-swagger-ui is a thin static-asset blueprint (just
+# renders the Swagger UI against an OpenAPI JSON file we author ourselves)
+# - no jsonschema/rpds-py in its dependency chain, unlike flasgger.
+# rpds-py needs a Rust compiler with an Android target, which isn't
+# available on Termux (same class of failure as DuckDB) - this avoids
+# that entirely while still giving proper interactive API docs.
+flask-swagger-ui>=4.11,<5.0
 
 # --- ORM (replacing raw sqlite3 calls incrementally - Step 3/Architecture) ---
 # MIT license. Not yet wired in; added here so Step 3 can start without
