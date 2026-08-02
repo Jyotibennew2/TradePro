@@ -1,0 +1,26 @@
+# TradePro Backend Dependencies
+# Pinned to major versions actually used - keeps Termux/ARM installs
+# reproducible and avoids surprise breaking upgrades.
+#
+# NOTE: Some packages here need --break-system-packages on Termux, e.g.:
+#   pip install -r requirements.txt --break-system-packages
+
+# --- Web framework ---
+flask>=3.0,<4.0
+flask-cors>=4.0,<5.0
+
+# --- Broker integration ---
+fyers-apiv3>=3.1,<4.0
+
+# --- HTTP client (Delta Exchange, AI provider fallback, webhooks) ---
+requests>=2.31,<3.0
+
+# --- API documentation (Swagger/OpenAPI) ---
+# MIT license. Auto-generates /apidocs from Flask route docstrings -
+# no manual OpenAPI YAML to maintain.
+flasgger>=0.9.7,<1.0
+
+# --- ORM (replacing raw sqlite3 calls incrementally - Step 3/Architecture) ---
+# MIT license. Not yet wired in; added here so Step 3 can start without
+# a second dependency-install round.
+sqlalchemy>=2.0,<3.0
