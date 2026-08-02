@@ -21,6 +21,7 @@ from typing import Optional
 
 from backend.config import APP_ID, SECRET, TOKEN, REDIRECT_URL
 from backend.pricing import bs
+from backend.brokers.base import BrokerAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +88,15 @@ def _http(
 # Fyers Service
 # ---------------------------------------------------------------------------
 
-class FyersService:
+class FyersService(BrokerAdapter):
     """
     All Fyers API interactions in one place.
     Instantiate once and reuse across requests.
+
+    Implements backend.brokers.base.BrokerAdapter - the common interface
+    every full broker integration (market data + orders/positions/funds)
+    should satisfy, so server.py and future multi-broker code can depend
+    on the interface rather than this concrete class.
     """
 
     _BASE      = "https://api-t1.fyers.in/api/v3"
