@@ -45,6 +45,14 @@ class PaperOrder:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        # Keep raw unix-epoch fields alongside the formatted display strings -
+        # the frontend needs a real numeric timestamp to build an accurate
+        # equity curve (Dashboard's chart was previously fabricating fake
+        # interpolated points instead of plotting real trade history because
+        # only a pre-formatted string was available, not a sortable/plottable
+        # timestamp).
+        d["entry_time_epoch"] = self.entry_time
+        d["exit_time_epoch"]  = self.exit_time
         d["entry_time"] = time.strftime("%d %b %H:%M:%S", time.localtime(self.entry_time))
         d["exit_time"]  = time.strftime("%d %b %H:%M:%S", time.localtime(self.exit_time)) if self.exit_time else ""
         return d
@@ -58,6 +66,14 @@ class PaperTradeEngine:
     """
     In-memory paper trading engine.
     Supports place, modify, exit, MTM, P&L, history.
+
+    KNOWN LIMITATION (tracked for a future fix): state is purely in-memory
+    (self._orders, self._history) - a server restart wipes all open
+    positions and trade history. Given how often this server gets
+    restarted during development (to pick up new code), this should be
+    persisted to SQLite the same way chain_archive.py persists option
+    snapshots. Not fixed yet to avoid bundling a data-model change into
+    this equity-curve bugfix; tracked as a follow-up.
     """
 
     def __init__(self, capital: float = INITIAL_CAPITAL) -> None:
