@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 from backend.risk import LOT_SIZES
+from backend import paper_trade_store as store
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,28 @@ class PaperOrder:
         d["exit_time"]  = time.strftime("%d %b %H:%M:%S", time.localtime(self.exit_time)) if self.exit_time else ""
         return d
 
+    @classmethod
+    def from_store_row(cls, row: dict) -> "PaperOrder":
+        """Reconstruct a PaperOrder from a raw SQLite row (see paper_trade_store)."""
+        return cls(
+            order_id    = row["order_id"],
+            symbol      = row["symbol"],
+            option_type = row["option_type"],
+            strike      = row["strike"],
+            expiry      = row["expiry"] or "",
+            action      = row["action"],
+            qty         = row["qty"],
+            entry_price = row["entry_price"],
+            exit_price  = row["exit_price"],
+            sl          = row["sl"],
+            target      = row["target"],
+            status      = row["status"],
+            entry_time  = row["entry_time"],
+            exit_time   = row["exit_time"],
+            pnl         = row["pnl"],
+            mtm         = row["mtm"],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Paper Trading Engine
@@ -64,23 +87,29 @@ class PaperOrder:
 
 class PaperTradeEngine:
     """
-    In-memory paper trading engine.
-    Supports place, modify, exit, MTM, P&L, history.
-
-    KNOWN LIMITATION (tracked for a future fix): state is purely in-memory
-    (self._orders, self._history) - a server restart wipes all open
-    positions and trade history. Given how often this server gets
-    restarted during development (to pick up new code), this should be
-    persisted to SQLite the same way chain_archive.py persists option
-    snapshots. Not fixed yet to avoid bundling a data-model change into
-    this equity-curve bugfix; tracked as a follow-up.
+    Paper trading engine. In-memory dicts (self._orders, self._history) are
+    the hot path for all reads - unchanged in shape/behavior from before.
+    Every state-changing call (place/exit/modify/auto-exit/reset) now also
+    writes through to SQLite (backend/paper_trade_store.py), and __init__
+    loads existing state back from there - so a server restart no longer
+    wipes open positions or trade history (previously it silently did,
+    every single restart).
     """
 
     def __init__(self, capital: float = INITIAL_CAPITAL) -> None:
-        self.capital       : float                  = capital
-        self.used_margin   : float                  = 0.0
-        self._orders       : dict[str, PaperOrder]  = {}
-        self._history      : list[PaperOrder]       = []
+        self.capital       : float                  = store.load_capital(capital)
+        self._orders       : dict[str, PaperOrder]  = {
+            row["order_id"]: PaperOrder.from_store_row(row) for row in store.load_open_orders()
+        }
+        self._history      : list[PaperOrder]       = [
+            PaperOrder.from_store_row(row) for row in store.load_history()
+        ]
+        # used_margin isn't persisted directly - it's fully recoverable as
+        # the sum of entry_price*qty across currently-open orders, which
+        # avoids a second source of truth that could drift out of sync.
+        self.used_margin   : float = sum(o.entry_price * o.qty for o in self._orders.values())
+        if self._orders or self._history:
+            logger.info(f"Paper trade state restored from disk: {len(self._orders)} open, {len(self._history)} closed")
 
     # ------------------------------------------------------------------
     # Place order
@@ -122,6 +151,7 @@ class PaperTradeEngine:
         )
         self._orders[order_id] = order
         self.used_margin      += margin_req
+        store.save_order(order.to_dict())
         logger.info(f"Paper order placed: {order_id} {symbol} {strike} {option_type} {action} qty={total_qty} @ {entry_price}")
         return {"success": True, "order_id": order_id, "order": order.to_dict()}
 
@@ -145,6 +175,7 @@ class PaperTradeEngine:
             order.sl = sl
         if target is not None:
             order.target = target
+        store.save_order(order.to_dict())
         logger.info(f"Paper order modified: {order_id} sl={order.sl} target={order.target}")
         return {"success": True, "order": order.to_dict()}
 
@@ -173,6 +204,8 @@ class PaperTradeEngine:
 
         self._history.append(order)
         del self._orders[order_id]
+        store.save_order(order.to_dict())   # upsert: same order_id, now status=CLOSED
+        store.save_capital(self.capital)
 
         logger.info(f"Paper order exited: {order_id} exit={exit_price} pnl={order.pnl}")
         return {"success": True, "pnl": order.pnl, "order": order.to_dict()}
@@ -201,6 +234,10 @@ class PaperTradeEngine:
                (order.action == "SELL" and ltp <= order.target):
                 return self._auto_exit(order, ltp, "TARGET_HIT")
 
+        # Note: mtm changes on still-open orders are NOT persisted on every
+        # tick (that would be a write on every price update, far too much
+        # I/O for a value that's recomputed live anyway) - only status
+        # transitions (place/exit/modify) are written through.
         return {"success": True, "mtm": order.mtm}
 
     def _auto_exit(self, order: PaperOrder, ltp: float, reason: str) -> dict:
@@ -214,6 +251,8 @@ class PaperTradeEngine:
         self.used_margin = max(0.0, self.used_margin - order.entry_price * order.qty)
         self._history.append(order)
         del self._orders[order.order_id]
+        store.save_order(order.to_dict())
+        store.save_capital(self.capital)
         logger.info(f"Auto exit [{reason}]: {order.order_id} pnl={order.pnl}")
         return {"success": True, "reason": reason, "pnl": order.pnl, "order": order.to_dict()}
 
@@ -255,6 +294,8 @@ class PaperTradeEngine:
         self.used_margin = 0.0
         self._orders     = {}
         self._history    = []
+        store.clear_all()
+        store.save_capital(capital)
         logger.info(f"Paper trading reset: capital={capital}")
         return {"success": True, "capital": capital}
 
