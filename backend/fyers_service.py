@@ -160,6 +160,26 @@ class FyersService(BrokerAdapter):
         """
         Fully automated token generation using TOTP.
         Returns {"success": True, "token": "..."} or {"success": False, "error": "..."}
+
+        AUDIT NOTE (2026 review): this method is currently NOT called
+        anywhere in the codebase. The actual daily token refresh (cron,
+        8:45 AM weekdays, via daily_start.sh) uses the standalone script
+        auto_token.py instead, which independently reimplements this same
+        5-step Fyers TOTP flow and writes the result to .env for the next
+        server startup to pick up.
+
+        Left in place deliberately rather than deleted: auto_token.py's
+        flow is battle-tested and handles live trading-account credentials
+        daily without incident, so it was NOT touched during this review
+        (per "don't touch working things without explicit confirmation").
+        This method updates only the in-memory token on a *running*
+        instance (no restart / no .env write) - potentially useful for a
+        future "refresh without restart" admin action - but until
+        something actually calls it, it's effectively dead code duplicating
+        auto_token.py's logic. If you add a caller for this, consider
+        instead making auto_token.py call this method (single
+        implementation) rather than keeping both flows independently
+        maintained.
         """
         try:
             # Step 1: Send OTP
