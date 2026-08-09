@@ -1,5 +1,5 @@
 """
-TradePro Backend - Batch Backtest Engine (V1)
+TradePro Backend - Batch Backtest Engine (V1 + Real-Data Multi-Leg Sweep)
 
 Runs many backtest combinations (strategies x instruments x timeframes x
 expiries x strikes) in one call and ranks the results. This module does NOT
@@ -10,6 +10,10 @@ already-tested calculation functions:
     instrument/timeframe/SL/trailing-SL/greeks-filter sweeps
   - run_walkforward_backtest() (backend/routes/backtest.py)  -> real
     archived-data sweeps across expiries/strikes
+  - strategy_leg_offsets()     (backend/routes/backtest.py)  -> reused to
+    build the same strategy leg shapes (straddle/strangle/ironCondor/
+    longCall/longPut) against REAL archived data, so a walk-forward batch
+    job replays an actual strategy — not just one naked leg per strike.
   - GreeksEngine                (backend/greeks.py)          -> reused
     inside run_synthetic_backtest for the optional greeks_filter
 
@@ -22,7 +26,7 @@ from dataclasses import dataclass, field
 from itertools import product
 from typing import Optional
 
-from backend.routes.backtest import run_synthetic_backtest, run_walkforward_backtest
+from backend.routes.backtest import run_synthetic_backtest, run_walkforward_backtest, strategy_leg_offsets
 
 # Hard cap on how many job combinations one batch request can spawn, so a
 # careless "all strategies x all symbols x all timeframes" body can't hang
@@ -76,7 +80,47 @@ class BatchBacktestEngine:
 
     def build_walkforward_jobs(self, symbols: list, expiries: list, strikes: list,
                                 entry_time: int, exit_time: Optional[int] = None,
+                                strategies: Optional[list] = None,
                                 option_type: str = "CE", action: str = "BUY", lots: int = 1) -> list[BatchJob]:
+        """
+        strikes here are ANCHOR strikes (one per combination) — for a
+        single-leg sweep (strategies omitted) the anchor IS the traded
+        strike, unchanged from the original behaviour. For a strategy
+        sweep, each anchor is treated as the ATM for that job and the
+        strategy's real legs are built around it via strategy_leg_offsets()
+        — e.g. anchor=24000 + strangle -> SELL 24200 CE, SELL 23800 PE.
+
+        Each job still targets exactly one (symbol, expiry) pair, so
+        chain_archive queries (inside run_walkforward_backtest) stay
+        scoped to that single instrument+expiry — legs are never mixed
+        across instruments or expiries.
+
+        strategies : optional list of strategy keys (straddle/strangle/
+                     ironCondor/longCall/longPut). When given, combinations
+                     become strategies x symbols x expiries x strikes(anchor).
+                     When omitted, falls back to the original single naked
+                     leg per (symbol, expiry, strike) using option_type/action
+                     — unchanged for any existing caller.
+        """
+        if strategies:
+            combos = list(product(strategies, symbols, expiries, strikes))[:MAX_JOBS]
+            jobs = []
+            for strat, sym, exp, anchor in combos:
+                legs = [
+                    {
+                        "strike"     : anchor + leg["offset"],
+                        "option_type": leg["option_type"],
+                        "action"     : leg["action"],
+                        "lots"       : lots,
+                    }
+                    for leg in strategy_leg_offsets(strat)
+                ]
+                jobs.append(BatchJob(
+                    kind="walkforward", symbol=sym, expiry=exp, legs=legs,
+                    entry_time=entry_time, exit_time=exit_time, strategy=strat,
+                ))
+            return jobs
+
         combos = list(product(symbols, expiries, strikes))[:MAX_JOBS]
         return [
             BatchJob(
@@ -122,6 +166,7 @@ class BatchBacktestEngine:
                     "job": self._label(job),
                     "kind": "walkforward",
                     "symbol": job.symbol, "expiry": job.expiry, "legs": job.legs,
+                    "strategy": job.strategy,
                     "summary": summary,
                     "exit_reason": out["exit"]["reason"],
                 })
@@ -155,6 +200,8 @@ class BatchBacktestEngine:
         if job.kind == "synthetic":
             return f"{job.strategy}/{job.symbol}/{job.resolution}"
         strike = job.legs[0]["strike"] if job.legs else "?"
+        if job.strategy:
+            return f"{job.strategy}/{job.symbol}/{job.expiry}/{strike}"
         return f"{job.symbol}/{job.expiry}/{strike}"
 
     @staticmethod
