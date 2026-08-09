@@ -1,5 +1,5 @@
 """
-TradePro Backend - Batch Backtest Route (V1)
+TradePro Backend - Batch Backtest Route (V1 + Real-Data Multi-Leg Sweep)
 
 POST /api/backtest/batch
 
@@ -48,15 +48,28 @@ def backtest_batch():
       rank_by    : "total_pnl" | "roi_pct" | "win_rate" | "max_drawdown"
                    | "profit_factor" | "risk_reward"   (default "total_pnl")
 
-    Body (walk-forward sweep — multi-expiry/strike, uses real archived data):
+    Body (walk-forward sweep — multi-instrument/expiry/strike, uses REAL
+    archived option-chain data, not Black-Scholes):
       mode       : "walkforward"
-      symbols    : ["NIFTY", ...]
+      symbols    : ["NIFTY", "BANKNIFTY", ...]
       expiries   : ["2026-08-28", ...]
-      strikes    : [24000, 24500, 25000, ...]
-      entry_time : unix epoch seconds                (required)
+      strikes    : [24000, 24500, 25000, ...]        anchor strikes
+      entry_time : unix epoch seconds                (required — must fall
+                   within archived snapshots for the chosen symbol+expiry;
+                   jobs with no data at that time report individually in
+                   "failed" rather than failing the whole batch)
       exit_time  : optional unix epoch
-      option_type: "CE" | "PE"                        (default "CE")
-      action     : "BUY" | "SELL"                      (default "BUY")
+      strategies : optional ["straddle","strangle","ironCondor","longCall",
+                   "longPut"]. When given, each combination
+                   (strategy x symbol x expiry x anchor strike) builds the
+                   strategy's real multi-leg position around that anchor via
+                   strategy_leg_offsets() — the SAME strategy shapes Single/
+                   Compare backtest use, replayed on real archived LTPs.
+                   Every job stays scoped to one symbol + one expiry, so
+                   legs are never mixed across instruments or expiries.
+      option_type: "CE" | "PE"     (only used when strategies is omitted —
+                   single naked-leg sweep, original V1 behaviour)
+      action     : "BUY" | "SELL"  (only used when strategies is omitted)
       lots       : int                                 (default 1)
       ... plus lot_size, sl_pct, tgt_pct, trailing_sl_pct, rank_by as above
     """
@@ -81,16 +94,21 @@ def backtest_batch():
         market = get_ctx()["market"]
 
         if mode == "walkforward":
-            expiries   = b.get("expiries", [])
-            strikes    = b.get("strikes", [])
-            entry_time = b.get("entry_time")
-            exit_time  = b.get("exit_time")
+            expiries    = b.get("expiries", [])
+            strikes     = b.get("strikes", [])
+            entry_time  = b.get("entry_time")
+            exit_time   = b.get("exit_time")
+            strategies  = b.get("strategies") or None  # optional multi-leg sweep
             option_type = b.get("option_type", "CE")
             action      = b.get("action", "BUY")
             lots        = int(b.get("lots", 1))
 
             if not expiries or not strikes or not entry_time:
                 return error("expiries, strikes and entry_time are required for mode=walkforward", 400)
+            if strategies:
+                ok, msg = _validate_each(strategies, validate_strategy)
+                if not ok:
+                    return error(msg, 400)
 
             engine = BatchBacktestEngine(
                 market, lot_size=lot_size, sl_pct=sl_pct, tgt_pct=tgt_pct,
@@ -98,7 +116,8 @@ def backtest_batch():
             )
             jobs = engine.build_walkforward_jobs(
                 symbols, expiries, strikes, int(entry_time),
-                int(exit_time) if exit_time else None, option_type, action, lots,
+                exit_time=int(exit_time) if exit_time else None,
+                strategies=strategies, option_type=option_type, action=action, lots=lots,
             )
         else:
             strategies  = b.get("strategies", [])

@@ -70,6 +70,48 @@ def compute_summary_metrics(trades: list, initial_capital: float = 0.0) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Strategy leg shapes (reused by both the Black-Scholes engine below and the
+# real-archived-data walk-forward batch builder in backend/batch_backtest.py)
+# ---------------------------------------------------------------------------
+
+def strategy_leg_offsets(strategy: str) -> list[dict]:
+    """
+    Returns each strategy's legs as {offset, option_type, action}, where
+    `offset` is the strike distance in points from an ATM anchor strike.
+
+    These are the SAME point offsets (200/400) and CE/PE/BUY/SELL shapes
+    already used inline below in run_synthetic_backtest()'s if/elif branch
+    — extracted here as a small pure lookup so a second caller (the
+    walk-forward batch job builder) can build the identical strategy shape
+    against real archived option-chain data without duplicating these
+    numbers. run_synthetic_backtest() itself is unchanged and does not call
+    this — it keeps its own inline branch as-is, so Single/Compare backtest
+    behaviour carries zero risk from this addition.
+    """
+    if strategy == "straddle":
+        return [
+            {"offset": 0, "option_type": "CE", "action": "SELL"},
+            {"offset": 0, "option_type": "PE", "action": "SELL"},
+        ]
+    if strategy == "strangle":
+        return [
+            {"offset":  200, "option_type": "CE", "action": "SELL"},
+            {"offset": -200, "option_type": "PE", "action": "SELL"},
+        ]
+    if strategy == "ironCondor":
+        return [
+            {"offset":  200, "option_type": "CE", "action": "SELL"},
+            {"offset":  400, "option_type": "CE", "action": "BUY"},
+            {"offset": -200, "option_type": "PE", "action": "SELL"},
+            {"offset": -400, "option_type": "PE", "action": "BUY"},
+        ]
+    if strategy == "longCall":
+        return [{"offset": 0, "option_type": "CE", "action": "BUY"}]
+    # longPut (matches run_synthetic_backtest's else branch)
+    return [{"offset": 0, "option_type": "PE", "action": "BUY"}]
+
+
 def run_synthetic_backtest(
     market,
     symbol: str,
