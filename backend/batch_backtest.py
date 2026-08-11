@@ -68,11 +68,17 @@ class BatchBacktestEngine:
         self.tgt_pct         = tgt_pct
         self.trailing_sl_pct = trailing_sl_pct
         self.greeks_filter   = greeks_filter
+        # Set by build_synthetic_jobs()/build_walkforward_jobs() to the raw
+        # combination count BEFORE the MAX_JOBS slice, so run_and_rank() can
+        # report how many combos were requested vs. actually executed.
+        self._last_requested_jobs: Optional[int] = None
 
     # -- job builders --------------------------------------------------
 
     def build_synthetic_jobs(self, strategies: list, symbols: list, resolutions: list) -> list[BatchJob]:
-        combos = list(product(strategies, symbols, resolutions))[:MAX_JOBS]
+        combos_full = list(product(strategies, symbols, resolutions))
+        self._last_requested_jobs = len(combos_full)
+        combos = combos_full[:MAX_JOBS]
         return [
             BatchJob(kind="synthetic", symbol=sym, strategy=strat, resolution=res)
             for strat, sym, res in combos
@@ -103,7 +109,9 @@ class BatchBacktestEngine:
                      — unchanged for any existing caller.
         """
         if strategies:
-            combos = list(product(strategies, symbols, expiries, strikes))[:MAX_JOBS]
+            combos_full = list(product(strategies, symbols, expiries, strikes))
+            self._last_requested_jobs = len(combos_full)
+            combos = combos_full[:MAX_JOBS]
             jobs = []
             for strat, sym, exp, anchor in combos:
                 legs = [
@@ -121,7 +129,9 @@ class BatchBacktestEngine:
                 ))
             return jobs
 
-        combos = list(product(symbols, expiries, strikes))[:MAX_JOBS]
+        combos_full = list(product(symbols, expiries, strikes))
+        self._last_requested_jobs = len(combos_full)
+        combos = combos_full[:MAX_JOBS]
         return [
             BatchJob(
                 kind="walkforward", symbol=sym, expiry=exp,
@@ -186,11 +196,18 @@ class BatchBacktestEngine:
         for i, r in enumerate(ok_results, start=1):
             r["rank"] = i
 
+        # requested_jobs = combos BEFORE the MAX_JOBS slice (set by whichever
+        # build_*_jobs() call produced `jobs`). Falls back to len(jobs) if a
+        # caller ever passes a hand-built job list without using a builder,
+        # so this never reports something smaller than what actually ran.
+        requested_jobs = self._last_requested_jobs if self._last_requested_jobs is not None else len(jobs)
+
         return {
-            "rank_by"     : rank_by,
-            "total_jobs"  : len(jobs),
-            "ranked"      : ok_results,
-            "failed"      : err_results,
+            "rank_by"        : rank_by,
+            "requested_jobs" : requested_jobs,
+            "total_jobs"     : len(jobs),
+            "ranked"         : ok_results,
+            "failed"         : err_results,
         }
 
     # -- helpers --------------------------------------------------
