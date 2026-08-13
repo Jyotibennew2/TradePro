@@ -189,10 +189,13 @@ class BatchBacktestEngine:
         ok_results  = [r for r in results if "error" not in r]
         err_results = [r for r in results if "error" in r]
 
-        # max_drawdown is negative-or-zero (worse = more negative), so for
-        # ranking "best first" we sort ascending for that one metric only.
-        reverse = rank_by != "max_drawdown"
-        ok_results.sort(key=lambda r: r["summary"].get(rank_by, 0), reverse=reverse)
+        # "Best first" is descending for every metric, including
+        # max_drawdown: values are negative-or-zero (worse = more
+        # negative), so 0 (no drawdown) must sort ahead of -9000 (bad
+        # drawdown) — that's still descending order, same as P&L/ROI/win
+        # rate/profit factor/risk-reward. (Previously this metric alone
+        # used ascending order, which put the WORST drawdown at rank 1.)
+        ok_results.sort(key=lambda r: r["summary"].get(rank_by, 0), reverse=True)
         for i, r in enumerate(ok_results, start=1):
             r["rank"] = i
 
