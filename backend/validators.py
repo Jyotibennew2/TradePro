@@ -4,6 +4,7 @@ Validate incoming request parameters.
 Compatible with Python 3.11+, Termux, Linux.
 """
 
+import re
 from typing import Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -14,6 +15,13 @@ VALID_SYMBOLS   : set[str] = {"NIFTY", "BANKNIFTY", "MIDCPNIFTY"}
 VALID_STRATEGIES: set[str] = {"straddle", "strangle", "ironCondor", "longCall", "longPut"}
 MIN_STRIKE_COUNT: int      = 1
 MAX_STRIKE_COUNT: int      = 20
+
+# Fully-qualified NSE equity/index symbol, Fyers convention, e.g.
+# "NSE:RELIANCE-EQ", "NSE:M&M-EQ", "NSE:NIFTY50-INDEX".
+# Used only by the /historical route (equity swing-scanning) — option-chain
+# routes stay index-only via VALID_SYMBOLS, since options only exist for
+# NIFTY/BANKNIFTY/MIDCPNIFTY.
+EQUITY_SYMBOL_RE = re.compile(r'^NSE:[A-Z0-9&\-]+-(EQ|INDEX)$')
 
 # Friendly resolution name -> Fyers API resolution code
 # https://myapi.fyers.in/docs  (resolution: "D" for daily, minutes as string otherwise)
@@ -43,12 +51,32 @@ MAX_DAYS_BY_RESOLUTION: dict[str, int] = {
 # ---------------------------------------------------------------------------
 
 def validate_symbol(symbol: Optional[str]) -> Tuple[bool, str]:
-    """Validate option chain symbol."""
+    """Validate option chain symbol (index-only — options only exist for these)."""
     if not symbol:
         return False, "symbol is required"
     if symbol.upper() not in VALID_SYMBOLS:
         return False, f"symbol must be one of {sorted(VALID_SYMBOLS)}"
     return True, ""
+
+
+def validate_historical_symbol(symbol: Optional[str]) -> Tuple[bool, str]:
+    """
+    Validate symbol for /historical (candle data). Broader than
+    validate_symbol: accepts the index shortcuts (NIFTY/BANKNIFTY/
+    MIDCPNIFTY) *or* any fully-qualified NSE equity/index symbol
+    (e.g. "NSE:RELIANCE-EQ") for equity swing/momentum scanning.
+    """
+    if not symbol:
+        return False, "symbol is required"
+    s = symbol.strip().upper()
+    if s in VALID_SYMBOLS:
+        return True, ""
+    if EQUITY_SYMBOL_RE.match(s):
+        return True, ""
+    return False, (
+        f"symbol must be one of {sorted(VALID_SYMBOLS)} "
+        "or a fully-qualified NSE symbol like NSE:RELIANCE-EQ"
+    )
 
 
 def validate_expiry(expiry: Optional[str]) -> Tuple[bool, str]:
