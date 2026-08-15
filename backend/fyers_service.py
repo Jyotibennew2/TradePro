@@ -251,6 +251,7 @@ class FyersService:
                             "oi"   : v.get("oi", 0),
                         }
                     return {"success": True, "data": data, "mock": False}
+                logger.warning(f"Quotes non-success response for {symbols}: {resp}")
             except Exception as e:
                 logger.error(f"Quotes error: {e}")
 
@@ -295,8 +296,15 @@ class FyersService:
                             for c in raw
                         ]
                         return {"success": True, "mock": False, "candles": candles}
+                    logger.warning(f"History empty candles for {fyers_symbol} ({resolution}, {days}d): {resp}")
+                else:
+                    # Fyers returned a response but not a success code — e.g. invalid
+                    # symbol, unsupported segment, or a rejected request. This is NOT
+                    # a Python exception, so without this log line it fails silently
+                    # and falls straight to mock data below with zero trace.
+                    logger.warning(f"History non-success response for {fyers_symbol} ({resolution}, {days}d): {resp}")
             except Exception as e:
-                logger.error(f"History error: {e}")
+                logger.error(f"History error for {fyers_symbol}: {e}")
 
         return self._mock_history(fyers_symbol, days, resolution)
 
