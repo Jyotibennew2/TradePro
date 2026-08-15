@@ -6,7 +6,7 @@ from flask import Blueprint, jsonify, request
 from backend.response import error
 from backend.logger import get_logger
 from backend.pricing import BlackScholes
-from backend.validators import validate_symbol, validate_expiry, validate_strike_count, validate_resolution
+from backend.validators import validate_symbol, validate_historical_symbol, validate_expiry, validate_strike_count, validate_resolution
 from backend.services import chain_archive
 from backend.routes._ctx import get_ctx
 
@@ -263,12 +263,18 @@ def option_chain_archive_stats():
 
 @market_data_bp.route("/api/historical")
 def historical():
+    """
+    Historical candles. Accepts the index shortcuts (NIFTY/BANKNIFTY/
+    MIDCPNIFTY) *or* any fully-qualified NSE equity symbol
+    (e.g. NSE:RELIANCE-EQ) — used by the Equity Quant Scanner to pull
+    per-stock candles for swing/momentum scoring.
+    """
     market = get_ctx()["market"]
     symbol     = request.args.get("symbol", "NIFTY")
     days       = int(request.args.get("days", 30))
     resolution = request.args.get("resolution", "1d")
 
-    ok, msg = validate_symbol(symbol)
+    ok, msg = validate_historical_symbol(symbol)
     if not ok:
         return error(msg, 400)
     ok, msg = validate_resolution(resolution)
