@@ -2,14 +2,20 @@
 TradePro Backend - Fyers Service
 All Fyers API logic in one service class.
 Compatible with Python 3.11+, Termux, Linux.
+
+NOTE: Mock/synthetic market data generation has been intentionally removed.
+Every method below either returns real Fyers data or a clear error with
+"mock": false. No random-walk or reconstructed candles/quotes/chains are
+ever generated as a silent fallback. (backend/routes/optionchain/historical
+is a separate, explicitly-labeled Black-Scholes reconstruction endpoint
+for a *user-supplied* historical spot price — that is unrelated to this
+file and unaffected by this change.)
 """
 
 import hashlib
 import hmac
 import time
 import base64
-import math
-import random
 import struct
 import json
 import logging
@@ -20,7 +26,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from backend.config import APP_ID, SECRET, TOKEN, REDIRECT_URL
-from backend.pricing import bs
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +37,6 @@ SYMBOL_MAP: dict[str, str] = {
     "NIFTY"     : "NSE:NIFTY50-INDEX",
     "BANKNIFTY" : "NSE:NIFTYBANK-INDEX",
     "MIDCPNIFTY": "NSE:NIFTYMID100-INDEX",
-}
-
-BASE_PRICES: dict[str, float] = {
-    "NSE:NIFTY50-INDEX"    : 24300.0,
-    "NSE:NIFTYBANK-INDEX"  : 58000.0,
-    "NSE:NIFTYMID100-INDEX": 12800.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -91,6 +90,11 @@ class FyersService:
     """
     All Fyers API interactions in one place.
     Instantiate once and reuse across requests.
+
+    Every public get_*() method returns real Fyers data on success, or a
+    dict with "success": False, "mock": False, "error": "<reason>" on any
+    failure (missing client, Fyers non-success response, or exception).
+    Nothing here ever synthesizes market data.
     """
 
     _BASE      = "https://api-t1.fyers.in/api/v3"
@@ -230,123 +234,87 @@ class FyersService:
     # ------------------------------------------------------------------
 
     def get_quotes(self, symbols: str = "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX") -> dict:
-        """Returns live or mock quotes."""
-        if self._client:
-            try:
-                resp = self._client.quotes({"symbols": symbols})
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    data: dict = {}
-                    for item in resp.get("d", []):
-                        v   = item.get("v", {})
-                        sym = v.get("symbol") or item.get("n", "")
-                        data[sym] = {
-                            "ltp"  : v.get("lp", 0),
-                            "ch"   : v.get("ch", 0),
-                            "chp"  : v.get("chp", 0),
-                            "open" : v.get("open_price", 0),
-                            "high" : v.get("high_price", 0),
-                            "low"  : v.get("low_price", 0),
-                            "close": v.get("prev_close_price", 0),
-                            "vol"  : v.get("volume", 0),
-                            "oi"   : v.get("oi", 0),
-                        }
-                    return {"success": True, "data": data, "mock": False}
-                logger.warning(f"Quotes non-success response for {symbols}: {resp}")
-            except Exception as e:
-                logger.error(f"Quotes error: {e}")
-
-        # Mock fallback
-        t = time.time()
-        return {
-            "success": True,
-            "mock"   : True,
-            "data"   : {
-                "NSE:NIFTY50-INDEX"    : {"ltp": round(24300 + math.sin(t / 20) * 25 + (t % 10) - 5, 2), "ch": 120.5,  "chp":  0.50},
-                "NSE:NIFTYBANK-INDEX"  : {"ltp": round(58000 + math.sin(t / 25) * 30 + (t % 10) - 5, 2), "ch": -120.5, "chp": -0.25},
-                "NSE:NIFTYMID100-INDEX": {"ltp": round(12800 + math.sin(t / 22) * 15, 2),                 "ch":  45.0,  "chp":  0.35},
-            },
-        }
+        """Returns live Fyers quotes, or a clear error (never synthetic data)."""
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
+        try:
+            resp = self._client.quotes({"symbols": symbols})
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                data: dict = {}
+                for item in resp.get("d", []):
+                    v   = item.get("v", {})
+                    sym = v.get("symbol") or item.get("n", "")
+                    data[sym] = {
+                        "ltp"  : v.get("lp", 0),
+                        "ch"   : v.get("ch", 0),
+                        "chp"  : v.get("chp", 0),
+                        "open" : v.get("open_price", 0),
+                        "high" : v.get("high_price", 0),
+                        "low"  : v.get("low_price", 0),
+                        "close": v.get("prev_close_price", 0),
+                        "vol"  : v.get("volume", 0),
+                        "oi"   : v.get("oi", 0),
+                    }
+                return {"success": True, "data": data, "mock": False}
+            logger.warning(f"Quotes non-success response for {symbols}: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers quotes call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Quotes error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Historical candles
     # ------------------------------------------------------------------
 
     def get_history(self, symbol: str, days: int = 90, resolution: str = "D") -> dict:
-        """Returns live Fyers historical candles, or realistic mock candles."""
+        """Returns real Fyers historical candles, or a clear error (never synthetic candles)."""
         fyers_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
 
-        if self._client:
-            try:
-                to_ts   = int(time.time())
-                from_ts = to_ts - days * 86400
-                payload = {
-                    "symbol"     : fyers_symbol,
-                    "resolution" : resolution,
-                    "date_format": "0",
-                    "range_from" : str(from_ts),
-                    "range_to"   : str(to_ts),
-                    "cont_flag"  : "1",
-                }
-                resp = self._client.history(payload)
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    raw = resp.get("candles", [])
-                    if raw:
-                        candles = [
-                            {"t": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]}
-                            for c in raw
-                        ]
-                        return {"success": True, "mock": False, "candles": candles}
-                    logger.warning(f"History empty candles for {fyers_symbol} ({resolution}, {days}d): {resp}")
-                else:
-                    # Fyers returned a response but not a success code — e.g. invalid
-                    # symbol, unsupported segment, or a rejected request. This is NOT
-                    # a Python exception, so without this log line it fails silently
-                    # and falls straight to mock data below with zero trace.
-                    logger.warning(f"History non-success response for {fyers_symbol} ({resolution}, {days}d): {resp}")
-            except Exception as e:
-                logger.error(f"History error for {fyers_symbol}: {e}")
+        if not self._client:
+            return {"success": False, "mock": False, "symbol": fyers_symbol,
+                    "error": "Fyers client not authenticated (no token)"}
 
-        return self._mock_history(fyers_symbol, days, resolution)
+        try:
+            to_ts   = int(time.time())
+            from_ts = to_ts - days * 86400
+            payload = {
+                "symbol"     : fyers_symbol,
+                "resolution" : resolution,
+                "date_format": "0",
+                "range_from" : str(from_ts),
+                "range_to"   : str(to_ts),
+                "cont_flag"  : "1",
+            }
+            resp = self._client.history(payload)
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                raw = resp.get("candles", [])
+                if raw:
+                    candles = [
+                        {"t": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]}
+                        for c in raw
+                    ]
+                    return {"success": True, "mock": False, "candles": candles}
+                logger.warning(f"History empty candles for {fyers_symbol} ({resolution}, {days}d): {resp}")
+                return {"success": False, "mock": False, "symbol": fyers_symbol,
+                        "error": "Fyers returned zero candles for this symbol/range",
+                        "fyers_response": resp}
 
-    def _mock_history(self, symbol: str, days: int, resolution: str = "D") -> dict:
-        """
-        Generate realistic mock candles (random walk) when live data unavailable.
-        resolution: "D" for daily candles, or minutes as a string ("5","15","30","60","120")
-        for intraday candles — spaced accordingly instead of one-per-day.
-        """
-        base    = BASE_PRICES.get(symbol, 24300.0)
-        price   = base * 0.90
-        candles: list = []
-        now     = int(time.time())
-
-        if resolution == "D":
-            step_seconds   = 86400
-            candle_count   = days
-            vol_per_candle = (500000, 2000000)
-        else:
-            minutes         = int(resolution)
-            step_seconds    = minutes * 60
-            # ~6.25 trading hours/day (375 min) worth of candles per day
-            candles_per_day = max(1, 375 // minutes)
-            candle_count    = days * candles_per_day
-            vol_per_candle  = (5000, 50000)
-
-        for i in range(candle_count, -1, -1):
-            price  *= (1 + (random.random() - 0.49) * (0.015 if resolution == "D" else 0.004))
-            high    = price * (1 + random.random() * (0.008 if resolution == "D" else 0.002))
-            low     = price * (1 - random.random() * (0.008 if resolution == "D" else 0.002))
-            open_   = price * (1 + (random.random() - 0.5) * (0.005 if resolution == "D" else 0.0015))
-            volume  = int(random.uniform(*vol_per_candle))
-            candles.append({
-                "t"     : now - i * step_seconds,
-                "open"  : round(open_, 2),
-                "high"  : round(high,  2),
-                "low"   : round(low,   2),
-                "close" : round(price, 2),
-                "volume": volume,
-            })
-
-        return {"success": True, "mock": True, "candles": candles}
+            # Fyers returned a response but not a success code — e.g. invalid
+            # symbol, unsupported segment/permission, or a rejected request.
+            # Surfaced as a real, visible error — never silently mocked.
+            logger.warning(f"History non-success response for {fyers_symbol} ({resolution}, {days}d): {resp}")
+            return {
+                "success": False, "mock": False, "symbol": fyers_symbol,
+                "error": resp.get("message", "Fyers history call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"History error for {fyers_symbol}: {e}")
+            return {"success": False, "mock": False, "symbol": fyers_symbol, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Available expiries
@@ -355,40 +323,33 @@ class FyersService:
     def get_expiries(self, symbol: str) -> dict:
         """
         Returns the list of available expiry dates for a symbol's option chain
-        (both weekly and monthly contracts, as offered by Fyers). Each item:
-        {"expiry": "<unix timestamp string>", "date": "DD-MM-YYYY"}.
+        (both weekly and monthly contracts, as offered by Fyers), or a clear
+        error — never a synthetic Thursday-cycle fallback list.
+        Each item on success: {"expiry": "<unix timestamp string>", "date": "DD-MM-YYYY"}.
         """
         fyers_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
 
-        if self._client:
-            try:
-                payload = {"symbol": fyers_symbol, "strikecount": 1, "timestamp": ""}
-                resp = self._client.optionchain(payload)
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    expiry_data = resp.get("data", {}).get("expiryData", [])
-                    if expiry_data and "strike" not in expiry_data[0]:
-                        return {"success": True, "mock": False, "expiries": expiry_data}
-            except Exception as e:
-                logger.error(f"Expiries error: {e}")
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
 
-        return self._mock_expiries()
-
-    def _mock_expiries(self) -> dict:
-        """Synthetic expiry list — next 4 Thursdays (NSE index-option weekly cycle)."""
-        now = datetime.now()
-        days_ahead = (3 - now.weekday()) % 7   # Thursday == 3
-        if days_ahead == 0 and now.hour >= 15:
-            days_ahead = 7
-        first = now + timedelta(days=days_ahead)
-
-        expiries = []
-        for i in range(4):
-            d = first + timedelta(weeks=i)
-            expiries.append({
-                "date"  : d.strftime("%d-%m-%Y"),
-                "expiry": str(int(d.replace(hour=15, minute=30, second=0, microsecond=0).timestamp())),
-            })
-        return {"success": True, "mock": True, "expiries": expiries}
+        try:
+            payload = {"symbol": fyers_symbol, "strikecount": 1, "timestamp": ""}
+            resp = self._client.optionchain(payload)
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                expiry_data = resp.get("data", {}).get("expiryData", [])
+                if expiry_data and "strike" not in expiry_data[0]:
+                    return {"success": True, "mock": False, "expiries": expiry_data}
+                logger.warning(f"Expiries: unexpected response shape for {fyers_symbol}: {resp}")
+                return {"success": False, "mock": False, "error": "Fyers returned no expiry data", "fyers_response": resp}
+            logger.warning(f"Expiries non-success response for {fyers_symbol}: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers expiries call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Expiries error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Option Chain
@@ -400,126 +361,108 @@ class FyersService:
         expiry      : str = "",
         strike_count: int = 10,
     ) -> dict:
-        """Returns live or mock option chain."""
+        """Returns real Fyers option chain, or a clear error (never a synthetic Black-Scholes chain)."""
         fyers_symbol = SYMBOL_MAP.get(symbol.upper(), symbol)
 
-        if self._client:
-            try:
-                payload: dict = {"symbol": fyers_symbol, "strikecount": strike_count, "timestamp": expiry or ""}
-                resp = self._client.optionchain(payload)
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    return {"success": True, "data": resp.get("data", {}), "mock": False}
-            except Exception as e:
-                logger.error(f"Option chain error: {e}")
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
 
-        return self._mock_option_chain(fyers_symbol, strike_count)
-
-    def _mock_option_chain(self, symbol: str, count: int) -> dict:
-        """
-        Generate realistic mock option chain data — including bid/ask spread,
-        volume, and OI-change so downstream archiving/backtesting has the same
-        fields available in MOCK mode as in LIVE mode (Fyers returns
-        bid/ask/volume/oich per contract: strike_price, option_type, ltp,
-        ltpch, bid, ask, oi, oich, volume).
-        """
-        import hashlib as _h
-        base  = BASE_PRICES.get(symbol, 24300.0)
-        spot  = round(base + math.sin(time.time() / 30) * base * 0.001, 2)
-        step  = 100 if spot < 30000 else 200
-        atm   = round(spot / step) * step
-        rows  = []
-        for i in range(-count, count + 1):
-            K    = atm + i * step
-            ce   = round(bs(spot, K, 30 / 365, 0.065, 0.14, "call"), 2)
-            pe   = round(bs(spot, K, 30 / 365, 0.065, 0.14, "put"),  2)
-            oi   = max(0.05, 1 - abs(K - spot) / (spot * 0.12)) * 1_200_000
-            h    = int(_h.md5(str(K).encode()).hexdigest(), 16) % 1000 / 1000
-            skew = round(14 + (1.5 if K < spot else -1) * (abs(K - spot) / spot) * 80, 1)
-
-            # Bid/ask spread widens for far OTM strikes (thinner liquidity)
-            dist_pct = abs(K - spot) / spot
-            spread_pct = 0.004 + dist_pct * 0.03
-            ce_spread = max(round(ce * spread_pct, 2), 0.05)
-            pe_spread = max(round(pe * spread_pct, 2), 0.05)
-
-            rows.append({
-                "strike"  : K,
-                "ce_ltp"  : ce,   "pe_ltp"  : pe,
-                "ce_bid"  : round(max(ce - ce_spread / 2, 0.05), 2),
-                "ce_ask"  : round(ce + ce_spread / 2, 2),
-                "pe_bid"  : round(max(pe - pe_spread / 2, 0.05), 2),
-                "pe_ask"  : round(pe + pe_spread / 2, 2),
-                "ce_oi"   : int(oi * (0.7 + 0.6 * h)),       "pe_oi"  : int(oi * (0.7 + 0.6 * (1 - h))),
-                "ce_oich" : int(oi * (0.7 + 0.6 * h) * (random.random() - 0.5) * 0.15),
-                "pe_oich" : int(oi * (0.7 + 0.6 * (1 - h)) * (random.random() - 0.5) * 0.15),
-                "ce_volume": int(oi * 0.4 * h),               "pe_volume": int(oi * 0.4 * (1 - h)),
-                "ce_iv"   : skew, "pe_iv"   : skew,
-                "ce_delta": round(0.5 - (K - spot) / (spot * 0.3), 3),
-                "pe_delta": round(-0.5 - (K - spot) / (spot * 0.3), 3),
-                "atm"     : K == atm,
-            })
-        return {
-            "success": True,
-            "mock"   : True,
-            "spot"   : spot,
-            "data"   : {"expiryData": rows, "atmIndex": count},
-        }
+        try:
+            payload: dict = {"symbol": fyers_symbol, "strikecount": strike_count, "timestamp": expiry or ""}
+            resp = self._client.optionchain(payload)
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                return {"success": True, "data": resp.get("data", {}), "mock": False}
+            logger.warning(f"Option chain non-success response for {fyers_symbol}: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers option chain call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Option chain error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Funds
     # ------------------------------------------------------------------
 
     def get_funds(self) -> dict:
-        """Returns live or mock funds data."""
-        if self._client:
-            try:
-                resp = self._client.funds()
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    fl    = resp.get("fund_limit", [])
-                    total = next((f["equityAmount"] for f in fl if f.get("title") == "Total Balance"), 0)
-                    used  = next((f["equityAmount"] for f in fl if f.get("title") == "Utilised Amount"), 0)
-                    return {"success": True, "mock": False, "data": {"total": total, "used": used, "available": total - used}}
-            except Exception as e:
-                logger.error(f"Funds error: {e}")
-        return {"success": True, "mock": True, "data": {"total": 500000, "used": 0, "available": 500000}}
+        """Returns real Fyers funds data, or a clear error (never synthetic balances)."""
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
+        try:
+            resp = self._client.funds()
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                fl    = resp.get("fund_limit", [])
+                total = next((f["equityAmount"] for f in fl if f.get("title") == "Total Balance"), 0)
+                used  = next((f["equityAmount"] for f in fl if f.get("title") == "Utilised Amount"), 0)
+                return {"success": True, "mock": False, "data": {"total": total, "used": used, "available": total - used}}
+            logger.warning(f"Funds non-success response: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers funds call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Funds error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
 
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
 
     def get_orders(self) -> dict:
-        """Returns live or mock orders."""
-        if self._client:
-            try:
-                resp = self._client.orderbook()
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    return {"success": True, "mock": False, "data": resp.get("orderBook", [])}
-            except Exception as e:
-                logger.error(f"Orders error: {e}")
-        return {"success": True, "mock": True, "data": []}
+        """Returns real Fyers order book, or a clear error (never a synthetic empty/fake list)."""
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
+        try:
+            resp = self._client.orderbook()
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                return {"success": True, "mock": False, "data": resp.get("orderBook", [])}
+            logger.warning(f"Orders non-success response: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers orderbook call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Orders error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
 
     def place_order(self, order: dict) -> dict:
-        """Place a live or mock order."""
+        """
+        Place a live order via Fyers. NOTE (unchanged by this fix, flagged in
+        prior audit finding #1, out of scope for this change set): this does
+        not yet validate resp.get("code")/resp.get("s") before reporting
+        success — that remains a separate, not-yet-implemented fix.
+        """
         if self._client:
             try:
                 resp = self._client.place_order(order)
                 return {"success": True, "mock": False, "data": resp}
             except Exception as e:
                 logger.error(f"Place order error: {e}")
-                return {"success": False, "error": str(e)}
-        return {"success": False, "mock": True, "error": "Not authenticated"}
+                return {"success": False, "mock": False, "error": str(e)}
+        return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
 
     # ------------------------------------------------------------------
     # Positions
     # ------------------------------------------------------------------
 
     def get_positions(self) -> dict:
-        """Returns live or mock positions."""
-        if self._client:
-            try:
-                resp = self._client.positions()
-                if resp.get("code") == 200 or resp.get("s") == "ok":
-                    return {"success": True, "mock": False, "data": resp.get("netPositions", [])}
-            except Exception as e:
-                logger.error(f"Positions error: {e}")
-        return {"success": True, "mock": True, "data": []}
+        """Returns real Fyers net positions, or a clear error (never a synthetic empty/fake list)."""
+        if not self._client:
+            return {"success": False, "mock": False, "error": "Fyers client not authenticated (no token)"}
+        try:
+            resp = self._client.positions()
+            if resp.get("code") == 200 or resp.get("s") == "ok":
+                return {"success": True, "mock": False, "data": resp.get("netPositions", [])}
+            logger.warning(f"Positions non-success response: {resp}")
+            return {
+                "success": False, "mock": False,
+                "error": resp.get("message", "Fyers positions call failed"),
+                "fyers_code": resp.get("code"), "fyers_status": resp.get("s"),
+            }
+        except Exception as e:
+            logger.error(f"Positions error: {e}")
+            return {"success": False, "mock": False, "error": str(e)}
