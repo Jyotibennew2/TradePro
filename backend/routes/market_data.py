@@ -63,6 +63,12 @@ def option_chain_historical():
     trader can see what strikes/premiums/Greeks would plausibly have
     looked like on that day. Always returned with reconstructed=True so
     the frontend can label it clearly (never confuse this with a real quote).
+
+    This reconstructed data is NEVER written to the archive database —
+    this route only ever returns a response directly to the caller. The
+    real archive (chain_archive.save_snapshot, used by /archive/* routes
+    and the walk-forward backtest engine) only ever accepts live Fyers
+    data; see chain_archive.py's REAL-DATA-ONLY policy.
     """
     try:
         symbol         = request.args.get("symbol", "NIFTY")
@@ -257,8 +263,34 @@ def option_chain_archive_times():
 
 @market_data_bp.route("/api/optionchain/archive/stats")
 def option_chain_archive_stats():
-    """Diagnostics: total rows stored and the SQLite file's size on disk (MB)."""
+    """Diagnostics: total/real/mock/quarantined row counts and the SQLite file's size on disk (MB)."""
     return jsonify({"success": True, "data": chain_archive.db_stats()})
+
+
+@market_data_bp.route("/api/optionchain/archive/mock-audit")
+def option_chain_archive_mock_audit():
+    """
+    Read-only: counts of legacy mock=1 rows currently sitting in the
+    archive, grouped by symbol + expiry_date — lets you see exactly which
+    stale/mock data exists before deciding anything about it. Makes no
+    changes to the database. Pass `symbol` to filter to one symbol.
+    """
+    symbol = request.args.get("symbol", "") or None
+    return jsonify({"success": True, "data": chain_archive.mock_audit_summary(symbol)})
+
+
+@market_data_bp.route("/api/optionchain/archive/quarantine-mock", methods=["POST"])
+def option_chain_archive_quarantine_mock():
+    """
+    Flags every legacy mock=1 archive row as quarantined=1. Does NOT delete
+    any row, and is never called automatically anywhere — only reachable by
+    explicitly POSTing here. Quarantined rows were already excluded from
+    every /archive/* read (all reads filter mock=0 regardless of the
+    quarantine flag); this only adds an explicit, reversible audit-trail
+    marker for a human to review before deciding on physical deletion.
+    """
+    count = chain_archive.quarantine_stale_mock_rows()
+    return jsonify({"success": True, "quarantined": count})
 
 
 @market_data_bp.route("/api/historical")
