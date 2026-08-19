@@ -109,52 +109,38 @@ class MarketDataService:
     def _enrich_with_greeks(self, chain_result: dict, days_to_expiry: float) -> None:
         """
         Mutates chain_result in place, adding iv/delta/gamma/theta/vega to
-        every CE/PE entry — backed out from the real traded LTP. Handles
-        both response shapes:
-          - mock/reconstructed: data.expiryData = [{strike, ce_ltp, pe_ltp, ...}]
-          - live Fyers         : data.optionsChain = [{strike_price, option_type, ltp, ...}]
+        every CE/PE entry — backed out from the real traded LTP.
+
+        Only handles the live Fyers response shape:
+          data.optionsChain = [{strike_price, option_type, ltp, ...}]
+        This is the only shape FyersService.get_option_chain() ever returns
+        on success — there is no mock/reconstructed fallback anywhere in
+        this service, so no other shape needs to be handled here.
         """
         try:
             data = chain_result.get("data", {})
             T    = max(days_to_expiry, 0.5) / 365
 
-            # Mock / reconstructed shape — already strike-keyed rows
-            expiry_data = data.get("expiryData")
-            if expiry_data and isinstance(expiry_data, list) and expiry_data and "strike" in expiry_data[0]:
-                spot = chain_result.get("spot", 0) or 0
-                if not spot:
-                    return
-                for row in expiry_data:
-                    strike = row.get("strike")
-                    if strike is None:
-                        continue
-                    if row.get("ce_ltp"):
-                        g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "call", market_price=row["ce_ltp"])
-                        row["ce_iv"], row["ce_delta"], row["ce_gamma"], row["ce_theta"], row["ce_vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
-                    if row.get("pe_ltp"):
-                        g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, "put", market_price=row["pe_ltp"])
-                        row["pe_iv"], row["pe_delta"], row["pe_gamma"], row["pe_theta"], row["pe_vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
+            options_chain = data.get("optionsChain")
+            if not options_chain or not isinstance(options_chain, list):
                 return
 
-            # Live Fyers shape — flat list, one row per contract, spot carried on the "" option_type row
-            options_chain = data.get("optionsChain")
-            if options_chain and isinstance(options_chain, list):
-                spot = 0.0
-                for item in options_chain:
-                    if item.get("option_type", "") == "":
-                        spot = item.get("ltp", 0) or spot
-                        break
-                if not spot:
-                    return
-                otype_map = {"CE": "call", "PE": "put"}
-                for item in options_chain:
-                    otype = otype_map.get(item.get("option_type"))
-                    strike = item.get("strike_price")
-                    ltp    = item.get("ltp")
-                    if not otype or strike is None or not ltp:
-                        continue
-                    g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, otype, market_price=ltp)
-                    item["iv"], item["delta"], item["gamma"], item["theta"], item["vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
+            spot = 0.0
+            for item in options_chain:
+                if item.get("option_type", "") == "":
+                    spot = item.get("ltp", 0) or spot
+                    break
+            if not spot:
+                return
+            otype_map = {"CE": "call", "PE": "put"}
+            for item in options_chain:
+                otype = otype_map.get(item.get("option_type"))
+                strike = item.get("strike_price")
+                ltp    = item.get("ltp")
+                if not otype or strike is None or not ltp:
+                    continue
+                g = GreeksEngine.calculate(spot, strike, T, RISK_FREE_RATE, 0.15, otype, market_price=ltp)
+                item["iv"], item["delta"], item["gamma"], item["theta"], item["vega"] = g.iv, g.delta, g.gamma, g.theta, g.vega
         except Exception as e:
             logger.warning(f"Greeks enrichment failed: {e}")
 
@@ -173,8 +159,10 @@ class MarketDataService:
 
         interval accepts friendly names: "5m", "15m", "30m", "1h", "2h", "1d"
         (legacy "1D"/"D" also accepted and treated as "1d").
-        Delegates to FyersService.get_history() — returns real Fyers data
-        when authenticated, realistic mock data otherwise.
+        Delegates to FyersService.get_history() — real Fyers data on
+        success, or an explicit error/empty result when unavailable. There
+        is no mock fallback; the "mock" key on the returned dict reflects
+        exactly what get_history() reported.
         """
         norm = interval.lower() if interval not in ("D", "1D") else "1d"
         resolution = RESOLUTION_MAP.get(norm, "D")
