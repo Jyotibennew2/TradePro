@@ -2,6 +2,24 @@
 TradePro Backend - Background Scheduler
 Refresh quotes, option chain, run scanners, cleanup logs.
 Compatible with Python 3.11+, Termux, Linux.
+
+── Backoff pass ────────────────────────────────────────────────────────
+A task's func may now optionally return True/False to report whether its
+work actually succeeded (e.g. the underlying API call returned success).
+Returning None (or nothing) is treated as success, so existing tasks that
+don't report a result (like cache_cleanup) are unaffected.
+
+After FAILURE_THRESHOLD consecutive False results, the scheduler stops
+retrying that task at its normal interval and instead pauses it for a
+cooldown period that doubles on each further consecutive failure (capped
+at MAX_BACKOFF_SECONDS). A single success immediately clears the backoff
+and resumes the task's normal interval.
+
+This exists specifically to stop a "retry storm": previously, if Fyers
+returned a rate-limit/auth error, the scheduler kept calling that task
+again at its normal (often just a few seconds) interval indefinitely,
+which both wastes calls and can prolong an active rate-limit window
+instead of letting it clear.
 """
 
 import time
@@ -10,6 +28,10 @@ import logging
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+FAILURE_THRESHOLD   = 3     # consecutive failures before backoff kicks in
+BASE_BACKOFF_SECONDS  = 60    # first cooldown once threshold is crossed
+MAX_BACKOFF_SECONDS   = 600   # cooldown never grows past this (10 min)
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +53,8 @@ class ScheduledTask:
         self.last_run  = 0.0
         self.run_count = 0
         self.errors    = 0
+        self.consecutive_failures = 0
+        self.backoff_until        = 0.0   # monotonic timestamp; skip runs until past this
 
 
 # ---------------------------------------------------------------------------
@@ -97,16 +121,39 @@ class Scheduler:
             for task in self._tasks:
                 if not task.enabled:
                     continue
+                if task.backoff_until and now < task.backoff_until:
+                    continue
                 if now - task.last_run >= task.interval:
                     try:
-                        task.func()
+                        result = task.func()
                         task.last_run  = now
                         task.run_count += 1
                         logger.debug(f"Scheduler: '{task.name}' ran (#{task.run_count})")
+                        self._record_outcome(task, now, failed=(result is False))
                     except Exception as e:
                         task.errors += 1
                         logger.error(f"Scheduler: '{task.name}' error: {e}")
+                        self._record_outcome(task, now, failed=True)
             time.sleep(1)
+
+    def _record_outcome(self, task: ScheduledTask, now: float, failed: bool) -> None:
+        if failed:
+            task.consecutive_failures += 1
+            if task.consecutive_failures >= FAILURE_THRESHOLD:
+                backoff = min(
+                    MAX_BACKOFF_SECONDS,
+                    BASE_BACKOFF_SECONDS * (2 ** (task.consecutive_failures - FAILURE_THRESHOLD)),
+                )
+                task.backoff_until = now + backoff
+                logger.warning(
+                    f"Scheduler: '{task.name}' failed {task.consecutive_failures}x in a row — "
+                    f"backing off for {backoff:.0f}s"
+                )
+        else:
+            if task.consecutive_failures:
+                logger.info(f"Scheduler: '{task.name}' recovered after {task.consecutive_failures} failure(s)")
+            task.consecutive_failures = 0
+            task.backoff_until        = 0.0
 
     # ------------------------------------------------------------------
     # Status
@@ -114,6 +161,7 @@ class Scheduler:
 
     def status(self) -> list[dict]:
         """Return status of all tasks."""
+        now = time.monotonic()
         return [
             {
                 "name"      : t.name,
@@ -121,7 +169,9 @@ class Scheduler:
                 "enabled"   : t.enabled,
                 "run_count" : t.run_count,
                 "errors"    : t.errors,
-                "last_run"  : round(time.monotonic() - t.last_run, 1) if t.last_run else None,
+                "last_run"  : round(now - t.last_run, 1) if t.last_run else None,
+                "consecutive_failures": t.consecutive_failures,
+                "backoff_remaining"   : round(t.backoff_until - now, 1) if t.backoff_until and t.backoff_until > now else 0,
             }
             for t in self._tasks
         ]
