@@ -190,14 +190,29 @@ class MarketDataService:
     # Auto refresh (called by scheduler)
     # ------------------------------------------------------------------
 
-    def refresh_quotes(self) -> None:
-        """Force refresh quotes cache."""
+    def refresh_quotes(self) -> bool:
+        """
+        Force refresh quotes cache. Returns True/False based on whether the
+        underlying Fyers call actually succeeded — the scheduler uses this
+        to back off automatically after repeated failures (e.g. a rate
+        limit) instead of retrying at full frequency forever.
+        """
         quote_cache.delete("NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:NIFTYMID100-INDEX")
-        self.get_quotes()
-        logger.debug("Quotes cache refreshed")
+        result = self.get_quotes()
+        ok = bool(result.get("success"))
+        if ok:
+            logger.debug("Quotes cache refreshed")
+        return ok
 
-    def refresh_chain(self, symbol: str = "NIFTY") -> None:
-        """Force refresh option chain cache."""
+    def refresh_chain(self, symbol: str = "NIFTY") -> bool:
+        """
+        Force refresh option chain cache. Returns True/False based on
+        whether the underlying Fyers call actually succeeded — same
+        backoff purpose as refresh_quotes().
+        """
         chain_cache.delete(f"chain:{symbol}::")
-        self.get_option_chain(symbol)
-        logger.debug(f"Option chain cache refreshed: {symbol}")
+        result = self.get_option_chain(symbol)
+        ok = bool(result.get("success"))
+        if ok:
+            logger.debug(f"Option chain cache refreshed: {symbol}")
+        return ok

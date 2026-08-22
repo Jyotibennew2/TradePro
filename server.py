@@ -7,6 +7,17 @@ This file only wires up the app: services, scheduler tasks, and route
 blueprints. All actual route logic lives in backend/routes/*.py, each
 owned by a different area of the product so multiple people can work
 on different endpoints without touching this file or each other's files.
+
+── Rate-limit pass ──────────────────────────────────────────────────────
+Two changes to reduce pressure on the Fyers API and let a rate-limit
+window clear instead of being prolonged:
+  1. refresh_quotes/refresh_nifty run less often (was 3s/10s, now 8s/25s)
+     — still fast enough for practical use, meaningfully fewer calls/hour.
+  2. _archive_chains now reports overall success/failure to the scheduler
+     (so backend.scheduler's new backoff logic can pause it after repeated
+     failures) and adds a small delay between each expiry's API call to
+     spread the archive cycle's calls out instead of firing them back to
+     back.
 """
 
 import time
@@ -65,15 +76,21 @@ set_ctx(svc=_svc, market=_market)
 # Scheduler tasks
 # ---------------------------------------------------------------------------
 
-def _archive_chains():
+def _archive_chains() -> bool:
     """
     Every 5 min during market hours, save real option-chain snapshots to disk
     — for EVERY available expiry (weekly, next-weekly, monthly, ...) not just
     whichever one happens to be "nearest". Logs per-expiry and total timing
     so the actual cost on this device/network is visible in the server logs.
+
+    Returns False if every expiry call across both symbols failed (e.g. a
+    Fyers-side outage or rate limit) so the scheduler's backoff can kick in;
+    returns True as soon as at least one snapshot saves successfully, since
+    a partial failure isn't the same as "Fyers is unreachable right now".
     """
     cycle_start = time.time()
     saved_count = 0
+    attempted_count = 0
     for sym in ("NIFTY", "BANKNIFTY"):
         try:
             expiries = _market.get_expiries(sym).get("expiries", [])
@@ -81,17 +98,25 @@ def _archive_chains():
                 expiry_date = chain_archive.parse_expiry_to_date(exp.get("expiry", ""))
                 t0 = time.time()
                 result = _market.get_option_chain(symbol=sym, expiry=exp.get("expiry", ""), strike_count=20)
+                attempted_count += 1
                 ok = chain_archive.save_snapshot(sym, expiry_date, result)
                 if ok:
                     saved_count += 1
                 logger.info(f"Archive {sym} exp={expiry_date}: {time.time() - t0:.2f}s saved={ok}")
+                # Small gap between calls so a 14-expiry cycle doesn't fire
+                # back-to-back requests — negligible against the 5-minute
+                # interval, but reduces burst pressure on the Fyers API.
+                time.sleep(0.3)
         except Exception as e:
             logger.warning(f"Archive snapshot failed for {sym}: {e}")
     logger.info(f"Archive cycle complete: {saved_count} snapshots saved in {time.time() - cycle_start:.2f}s total")
+    if attempted_count > 0 and saved_count == 0:
+        return False
+    return True
 
 
-scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=3)
-scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=10)
+scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=8)
+scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=25)
 scheduler.add_task("cache_cleanup",   lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
 scheduler.add_task("archive_chains",  _archive_chains,                      interval=300)
 scheduler.start()
