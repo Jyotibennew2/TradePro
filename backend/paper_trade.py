@@ -58,6 +58,12 @@ class PaperTradeEngine:
     """
     In-memory paper trading engine.
     Supports place, modify, exit, MTM, P&L, history.
+
+    Instrument-agnostic: `option_type`/`strike`/`expiry` are purely
+    descriptive metadata (used for display only) — the P&L math below
+    never reads them, so options (NIFTY/BANKNIFTY/MIDCPNIFTY) and equity
+    (e.g. "NSE:RELIANCE-EQ", option_type="EQ", strike=0, expiry="") flow
+    through the exact same place/exit/modify/MTM logic.
     """
 
     def __init__(self, capital: float = INITIAL_CAPITAL) -> None:
@@ -83,7 +89,12 @@ class PaperTradeEngine:
         target      : float = 0.0,
     ) -> dict:
         """Place a paper trade order."""
-        lot_size    = LOT_SIZES.get(symbol.upper(), 50)
+        # LOT_SIZES only has NIFTY/BANKNIFTY/MIDCPNIFTY entries (options).
+        # Any symbol not in there — i.e. an equity symbol like
+        # "NSE:RELIANCE-EQ" — is 1 unit = 1 share, so the fallback here is
+        # 1, not the old 50 (which silently multiplied every equity qty by
+        # an options lot size). Explicit LOT_SIZES entries are untouched.
+        lot_size    = LOT_SIZES.get(symbol.upper(), 1)
         total_qty   = qty * lot_size
         margin_req  = entry_price * total_qty
 

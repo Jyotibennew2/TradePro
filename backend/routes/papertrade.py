@@ -3,7 +3,7 @@
 from flask import Blueprint, jsonify, request
 
 from backend.response import error
-from backend.validators import validate_symbol, validate_quantity, validate_price
+from backend.validators import validate_historical_symbol, validate_quantity, validate_price
 from backend.paper_trade import paper_engine
 
 papertrade_bp = Blueprint("papertrade", __name__)
@@ -24,8 +24,14 @@ def papertrade():
         return error("Unknown action", 400)
 
     # POST — place order
+    # validate_historical_symbol (not the option-chain-only validate_symbol)
+    # so this route accepts BOTH the option-chain index shortcuts
+    # (NIFTY/BANKNIFTY/MIDCPNIFTY) and fully-qualified NSE equity symbols
+    # (e.g. "NSE:RELIANCE-EQ") — the same validator /api/historical already
+    # uses for the Equity Quant Scanner. No behavior change for existing
+    # options callers: every symbol validate_symbol accepted, this accepts too.
     data = request.json or {}
-    ok, msg = validate_symbol(data.get("symbol", "NIFTY"))
+    ok, msg = validate_historical_symbol(data.get("symbol", "NIFTY"))
     if not ok:
         return error(msg, 400)
     ok, msg = validate_quantity(data.get("qty"))
