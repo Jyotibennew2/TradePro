@@ -18,6 +18,14 @@ window clear instead of being prolonged:
      failures) and adds a small delay between each expiry's API call to
      spread the archive cycle's calls out instead of firing them back to
      back.
+
+── Risk management pass (Phase 3) ───────────────────────────────────────
+_monitor_paper_trades() — a new scheduler task that calls the paper
+trade engine's existing update_mtm() (SL/Target check + auto-exit,
+already fully written in backend/paper_trade.py but never called from
+anywhere) for every open paper position, every 10s. This is what makes
+SL/Trailing-SL/Target actually enforce automatically instead of only
+updating when a user happens to view/exit a position manually.
 """
 
 import time
@@ -34,6 +42,7 @@ from backend.services.market_data import MarketDataService
 from backend.services            import chain_archive
 from backend.scheduler          import scheduler
 from backend.cache              import quote_cache, chain_cache
+from backend.paper_trade        import paper_engine
 
 from backend.routes import register_routes
 from backend.routes._ctx import set_ctx
@@ -115,10 +124,39 @@ def _archive_chains() -> bool:
     return True
 
 
-scheduler.add_task("refresh_quotes",  _market.refresh_quotes,               interval=8)
-scheduler.add_task("refresh_nifty",   lambda: _market.refresh_chain("NIFTY"), interval=25)
-scheduler.add_task("cache_cleanup",   lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
-scheduler.add_task("archive_chains",  _archive_chains,                      interval=300)
+def _monitor_paper_trades() -> bool:
+    """
+    Checks every OPEN paper position's live LTP against its SL/Target and
+    auto-exits if hit — via paper_engine.update_mtm(), which already
+    contained this exact logic (see backend/paper_trade.py) but had no
+    caller anywhere until this task. Uses MarketDataService.get_ltp(),
+    which itself reads from the 3s quote cache — refresh_quotes() already
+    keeps NIFTY/BANKNIFTY warm, and a per-symbol get_quotes() call for any
+    other open symbol (e.g. an equity paper position) is cheap and
+    independently cached.
+
+    Returns True when there's nothing to monitor (idle is not a failure)
+    or when it completes without an unexpected error, so this task never
+    triggers the scheduler's failure backoff just because the paper
+    account happens to be empty.
+    """
+    try:
+        open_positions = paper_engine.portfolio().get("open_positions", [])
+        for pos in open_positions:
+            ltp = _market.get_ltp(pos["symbol"])
+            if ltp:
+                paper_engine.update_mtm(pos["order_id"], ltp)
+        return True
+    except Exception as e:
+        logger.warning(f"Paper trade monitor failed: {e}")
+        return False
+
+
+scheduler.add_task("refresh_quotes",       _market.refresh_quotes,               interval=8)
+scheduler.add_task("refresh_nifty",        lambda: _market.refresh_chain("NIFTY"), interval=25)
+scheduler.add_task("cache_cleanup",        lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
+scheduler.add_task("archive_chains",       _archive_chains,                      interval=300)
+scheduler.add_task("monitor_paper_trades", _monitor_paper_trades,                interval=10)
 scheduler.start()
 
 # ---------------------------------------------------------------------------

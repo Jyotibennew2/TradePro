@@ -9,7 +9,7 @@ import uuid
 import logging
 from dataclasses import dataclass, asdict, field
 from typing import Optional
-from backend.risk import LOT_SIZES
+from backend.risk import LOT_SIZES, risk_manager
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,20 @@ class PaperTradeEngine:
     never reads them, so options (NIFTY/BANKNIFTY/MIDCPNIFTY) and equity
     (e.g. "NSE:RELIANCE-EQ", option_type="EQ", strike=0, expiry="") flow
     through the exact same place/exit/modify/MTM logic.
+
+    Risk gating (Phase 3): place_order() now consults the existing
+    `risk_manager` singleton (backend/risk.py) — a fully-built
+    RiskManager class that was never wired into this engine before —
+    for max open trades and daily loss limit, in addition to the
+    margin check that already existed here. remove_trade() is called
+    on every exit path (manual exit and SL/Target auto-exit) so the
+    open-trade counter always reflects reality.
+
+    "Daily" loss is approximated as loss for the current in-memory
+    session (this engine has no persistent per-calendar-day ledger —
+    it resets whenever the server restarts, same as everything else
+    in this class). Documented here rather than silently treated as
+    a true calendar-day limit.
     """
 
     def __init__(self, capital: float = INITIAL_CAPITAL) -> None:
@@ -101,6 +115,21 @@ class PaperTradeEngine:
         if margin_req > (self.capital - self.used_margin):
             logger.warning(f"Insufficient margin: required={margin_req} available={self.capital - self.used_margin}")
             return {"success": False, "error": "Insufficient margin"}
+
+        # Risk gate 1: daily (session) loss limit. risk_manager.capital is
+        # kept in sync with this engine's live capital so the limit is
+        # always computed off the real paper account size, not a stale
+        # default.
+        risk_manager.update_capital(self.capital)
+        session_loss = max(0.0, -sum(o.pnl for o in self._history))
+        daily = risk_manager.check_daily_loss(session_loss)
+        if daily.limit_hit:
+            logger.warning(f"Daily loss limit hit: loss={daily.daily_loss} limit={daily.limit}")
+            return {"success": False, "error": f"Daily loss limit reached (₹{daily.daily_loss}/₹{daily.limit}) — no new trades allowed this session"}
+
+        # Risk gate 2: max concurrent open trades.
+        if not risk_manager.add_trade():
+            return {"success": False, "error": f"Max open trades reached ({risk_manager.max_trades}) — close a position before opening another"}
 
         order_id = str(uuid.uuid4())[:8].upper()
         order    = PaperOrder(
@@ -168,6 +197,7 @@ class PaperTradeEngine:
 
         self._history.append(order)
         del self._orders[order_id]
+        risk_manager.remove_trade()
 
         logger.info(f"Paper order exited: {order_id} exit={exit_price} pnl={order.pnl}")
         return {"success": True, "pnl": order.pnl, "order": order.to_dict()}
@@ -209,6 +239,7 @@ class PaperTradeEngine:
         self.used_margin = max(0.0, self.used_margin - order.entry_price * order.qty)
         self._history.append(order)
         del self._orders[order.order_id]
+        risk_manager.remove_trade()
         logger.info(f"Auto exit [{reason}]: {order.order_id} pnl={order.pnl}")
         return {"success": True, "reason": reason, "pnl": order.pnl, "order": order.to_dict()}
 
@@ -230,6 +261,11 @@ class PaperTradeEngine:
             "unrealized_pnl" : round(total_mtm, 2),
             "realized_pnl"   : round(realized_pnl, 2),
             "total_pnl"      : round(total_mtm + realized_pnl, 2),
+            "risk"           : {
+                "max_trades"      : risk_manager.max_trades,
+                "daily_loss_limit": round(self.capital * risk_manager.daily_loss_limit, 2),
+                "session_loss"    : round(max(0.0, -realized_pnl), 2),
+            },
         }
 
     # ------------------------------------------------------------------
@@ -250,6 +286,12 @@ class PaperTradeEngine:
         self.used_margin = 0.0
         self._orders     = {}
         self._history    = []
+        # Bring the risk manager's open-trade counter back to zero too —
+        # otherwise a reset paper account would still be gated by
+        # trades that no longer exist.
+        while risk_manager._open_trades > 0:
+            risk_manager.remove_trade()
+        risk_manager.update_capital(capital)
         logger.info(f"Paper trading reset: capital={capital}")
         return {"success": True, "capital": capital}
 
