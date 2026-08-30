@@ -14,6 +14,7 @@ from backend.routes.market_data import market_data_bp
 from backend.routes.trading import trading_bp
 from backend.routes.backtest import backtest_bp
 from backend.routes.batch_backtest import batch_backtest_bp
+from backend.routes.backtest_store import saved_backtests_bp
 from backend.routes.greeks_strategy import greeks_strategy_bp
 from backend.routes.scanner import scanner_bp
 from backend.routes.papertrade import papertrade_bp
@@ -35,6 +36,7 @@ def register_routes(app):
     app.register_blueprint(trading_bp)
     app.register_blueprint(backtest_bp)
     app.register_blueprint(batch_backtest_bp)
+    app.register_blueprint(saved_backtests_bp)
     app.register_blueprint(greeks_strategy_bp)
     app.register_blueprint(scanner_bp)
     app.register_blueprint(papertrade_bp)
