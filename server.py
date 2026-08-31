@@ -26,6 +26,19 @@ already fully written in backend/paper_trade.py but never called from
 anywhere) for every open paper position, every 10s. This is what makes
 SL/Trailing-SL/Target actually enforce automatically instead of only
 updating when a user happens to view/exit a position manually.
+
+── Fyers auto re-login pass ──────────────────────────────────────────────
+_auto_relogin_fyers() — FyersService.auto_login() (a full TOTP-based
+login flow) and FYERS_CLIENT_ID/FYERS_PIN/FYERS_TOTP_KEY config values
+already existed, but nothing anywhere ever called auto_login() — so a
+daily Fyers token expiry (SEBI-mandated, ~24h) required a manual
+re-login every time. This task checks auth status periodically and,
+if expired, calls the existing auto_login() and persists the new token
+via the same _persist_token() the manual /api/auth/token route already
+uses — no new credential storage, no new login logic, just wiring
+existing pieces together. Skipped entirely (no Fyers calls at all) if
+FYERS_CLIENT_ID/PIN/TOTP_KEY aren't all configured, so this is a no-op
+for anyone who hasn't set up TOTP auto-login.
 """
 
 import time
@@ -34,7 +47,7 @@ from flask import Flask
 from flask_cors import CORS
 
 from backend.logger         import setup_logging, get_logger
-from backend.config         import APP_ID, SECRET, REDIRECT_URL, validate, summary
+from backend.config         import APP_ID, SECRET, REDIRECT_URL, CLIENT_ID, PIN, TOTP_KEY, validate, summary
 from backend.middleware     import register_middleware
 from backend.error_handler  import register_error_handlers
 from backend.fyers_service      import FyersService
@@ -46,6 +59,7 @@ from backend.paper_trade        import paper_engine
 
 from backend.routes import register_routes
 from backend.routes._ctx import set_ctx
+from backend.routes.auth import _persist_token
 
 # ---------------------------------------------------------------------------
 # Logging — must be first
@@ -152,11 +166,40 @@ def _monitor_paper_trades() -> bool:
         return False
 
 
+def _auto_relogin_fyers() -> bool:
+    """
+    Keeps the Fyers session alive without a manual daily re-login, using
+    the existing TOTP auto_login() flow. Cheap auth check (get_profile)
+    first; only calls the multi-step TOTP login when actually needed.
+
+    Returns True when skipped (not configured) or already authenticated
+    or a re-login succeeds; False only when a re-login was attempted and
+    failed, so the scheduler's backoff can slow down retries on repeated
+    failure instead of hammering Fyers every cycle.
+    """
+    if not (CLIENT_ID and PIN and TOTP_KEY):
+        return True  # not configured for TOTP auto-login — nothing to do
+
+    if _svc.is_authenticated():
+        return True
+
+    logger.info("Fyers session expired/invalid — attempting automatic TOTP re-login")
+    result = _svc.auto_login(CLIENT_ID, PIN, TOTP_KEY)
+    if result.get("success"):
+        _persist_token(result["token"])
+        logger.info("Fyers auto re-login successful — token refreshed and persisted")
+        return True
+
+    logger.warning(f"Fyers auto re-login failed: {result.get('error')}")
+    return False
+
+
 scheduler.add_task("refresh_quotes",       _market.refresh_quotes,               interval=8)
 scheduler.add_task("refresh_nifty",        lambda: _market.refresh_chain("NIFTY"), interval=25)
 scheduler.add_task("cache_cleanup",        lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
 scheduler.add_task("archive_chains",       _archive_chains,                      interval=300)
 scheduler.add_task("monitor_paper_trades", _monitor_paper_trades,                interval=10)
+scheduler.add_task("auto_relogin_fyers",   _auto_relogin_fyers,                  interval=300)
 scheduler.start()
 
 # ---------------------------------------------------------------------------
