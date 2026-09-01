@@ -28,20 +28,31 @@ SL/Trailing-SL/Target actually enforce automatically instead of only
 updating when a user happens to view/exit a position manually.
 
 ── Fyers auto re-login pass ──────────────────────────────────────────────
-_auto_relogin_fyers() — FyersService.auto_login() (a full TOTP-based
-login flow) and FYERS_CLIENT_ID/FYERS_PIN/FYERS_TOTP_KEY config values
-already existed, but nothing anywhere ever called auto_login() — so a
-daily Fyers token expiry (SEBI-mandated, ~24h) required a manual
-re-login every time. This task checks auth status periodically and,
-if expired, calls the existing auto_login() and persists the new token
-via the same _persist_token() the manual /api/auth/token route already
-uses — no new credential storage, no new login logic, just wiring
-existing pieces together. Skipped entirely (no Fyers calls at all) if
-FYERS_CLIENT_ID/PIN/TOTP_KEY aren't all configured, so this is a no-op
-for anyone who hasn't set up TOTP auto-login.
+_auto_relogin_fyers() — a mid-day safety net for Fyers token expiry, on
+top of the existing daily_start.sh cron job (8:45 AM weekdays + on boot
+via ~/.termux/boot/tradepro-boot.sh) that already runs auto_token.py and
+fully restarts the server once a day. That daily restart wipes all
+in-memory state (paper trading positions/history/risk counters), and
+doesn't help if the token happens to expire again before the next
+scheduled run. This task instead calls auto_token.renew_token() — the
+SAME proven TOTP flow daily_start.sh already relies on (auto_token.py
+is now committed to the repo; it used to be a local-only file) — and
+hot-swaps the fresh token into the already-running FyersService
+instance (_svc.token + _svc._init_client(), both existing), so paper
+trading state is never lost and no restart is needed.
+
+NOTE: FyersService.auto_login() (backend/fyers_service.py) is a
+SEPARATE, apparently-untested implementation of this same TOTP flow
+that diverges from auto_token.py's proven, working version at the
+auth-code exchange step (different API host, different response
+shape) — it was not used here for that reason, and is left as-is
+(unused) rather than fixed, since fixing/removing it is a separate,
+more invasive change outside this task's scope.
 """
 
 import time
+
+import auto_token
 
 from flask import Flask
 from flask_cors import CORS
@@ -59,7 +70,6 @@ from backend.paper_trade        import paper_engine
 
 from backend.routes import register_routes
 from backend.routes._ctx import set_ctx
-from backend.routes.auth import _persist_token
 
 # ---------------------------------------------------------------------------
 # Logging — must be first
@@ -168,14 +178,14 @@ def _monitor_paper_trades() -> bool:
 
 def _auto_relogin_fyers() -> bool:
     """
-    Keeps the Fyers session alive without a manual daily re-login, using
-    the existing TOTP auto_login() flow. Cheap auth check (get_profile)
-    first; only calls the multi-step TOTP login when actually needed.
+    Mid-day safety net — see module docstring above for why this exists
+    alongside the daily 8:45 AM cron job. Cheap auth check (get_profile)
+    first; only runs the multi-step TOTP login when actually needed.
 
-    Returns True when skipped (not configured) or already authenticated
+    Returns True when skipped (not configured), already authenticated,
     or a re-login succeeds; False only when a re-login was attempted and
-    failed, so the scheduler's backoff can slow down retries on repeated
-    failure instead of hammering Fyers every cycle.
+    failed, so the scheduler's backoff can slow down retries instead of
+    hammering Fyers every cycle.
     """
     if not (CLIENT_ID and PIN and TOTP_KEY):
         return True  # not configured for TOTP auto-login — nothing to do
@@ -184,14 +194,20 @@ def _auto_relogin_fyers() -> bool:
         return True
 
     logger.info("Fyers session expired/invalid — attempting automatic TOTP re-login")
-    result = _svc.auto_login(CLIENT_ID, PIN, TOTP_KEY)
-    if result.get("success"):
-        _persist_token(result["token"])
-        logger.info("Fyers auto re-login successful — token refreshed and persisted")
-        return True
+    try:
+        new_token = auto_token.renew_token()
+    except Exception as e:
+        logger.warning(f"Fyers auto re-login failed: {e}")
+        return False
 
-    logger.warning(f"Fyers auto re-login failed: {result.get('error')}")
-    return False
+    # Hot-swap the fresh token into the already-running client — no
+    # server restart, no loss of in-memory paper trading state.
+    # renew_token() already persisted it to .env via save_token_to_env(),
+    # so a future full restart (daily cron / reboot) also picks it up.
+    _svc.token = new_token
+    _svc._init_client()
+    logger.info("Fyers auto re-login successful — token refreshed and persisted")
+    return True
 
 
 scheduler.add_task("refresh_quotes",       _market.refresh_quotes,               interval=8)
