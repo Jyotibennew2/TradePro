@@ -26,15 +26,39 @@ already fully written in backend/paper_trade.py but never called from
 anywhere) for every open paper position, every 10s. This is what makes
 SL/Trailing-SL/Target actually enforce automatically instead of only
 updating when a user happens to view/exit a position manually.
+
+── Fyers auto re-login pass ──────────────────────────────────────────────
+_auto_relogin_fyers() — a mid-day safety net for Fyers token expiry, on
+top of the existing daily_start.sh cron job (8:45 AM weekdays + on boot
+via ~/.termux/boot/tradepro-boot.sh) that already runs auto_token.py and
+fully restarts the server once a day. That daily restart wipes all
+in-memory state (paper trading positions/history/risk counters), and
+doesn't help if the token happens to expire again before the next
+scheduled run. This task instead calls auto_token.renew_token() — the
+SAME proven TOTP flow daily_start.sh already relies on (auto_token.py
+is now committed to the repo; it used to be a local-only file) — and
+hot-swaps the fresh token into the already-running FyersService
+instance (_svc.token + _svc._init_client(), both existing), so paper
+trading state is never lost and no restart is needed.
+
+NOTE: FyersService.auto_login() (backend/fyers_service.py) is a
+SEPARATE, apparently-untested implementation of this same TOTP flow
+that diverges from auto_token.py's proven, working version at the
+auth-code exchange step (different API host, different response
+shape) — it was not used here for that reason, and is left as-is
+(unused) rather than fixed, since fixing/removing it is a separate,
+more invasive change outside this task's scope.
 """
 
 import time
+
+import auto_token
 
 from flask import Flask
 from flask_cors import CORS
 
 from backend.logger         import setup_logging, get_logger
-from backend.config         import APP_ID, SECRET, REDIRECT_URL, validate, summary
+from backend.config         import APP_ID, SECRET, REDIRECT_URL, CLIENT_ID, PIN, TOTP_KEY, validate, summary
 from backend.middleware     import register_middleware
 from backend.error_handler  import register_error_handlers
 from backend.fyers_service      import FyersService
@@ -152,11 +176,46 @@ def _monitor_paper_trades() -> bool:
         return False
 
 
+def _auto_relogin_fyers() -> bool:
+    """
+    Mid-day safety net — see module docstring above for why this exists
+    alongside the daily 8:45 AM cron job. Cheap auth check (get_profile)
+    first; only runs the multi-step TOTP login when actually needed.
+
+    Returns True when skipped (not configured), already authenticated,
+    or a re-login succeeds; False only when a re-login was attempted and
+    failed, so the scheduler's backoff can slow down retries instead of
+    hammering Fyers every cycle.
+    """
+    if not (CLIENT_ID and PIN and TOTP_KEY):
+        return True  # not configured for TOTP auto-login — nothing to do
+
+    if _svc.is_authenticated():
+        return True
+
+    logger.info("Fyers session expired/invalid — attempting automatic TOTP re-login")
+    try:
+        new_token = auto_token.renew_token()
+    except Exception as e:
+        logger.warning(f"Fyers auto re-login failed: {e}")
+        return False
+
+    # Hot-swap the fresh token into the already-running client — no
+    # server restart, no loss of in-memory paper trading state.
+    # renew_token() already persisted it to .env via save_token_to_env(),
+    # so a future full restart (daily cron / reboot) also picks it up.
+    _svc.token = new_token
+    _svc._init_client()
+    logger.info("Fyers auto re-login successful — token refreshed and persisted")
+    return True
+
+
 scheduler.add_task("refresh_quotes",       _market.refresh_quotes,               interval=8)
 scheduler.add_task("refresh_nifty",        lambda: _market.refresh_chain("NIFTY"), interval=25)
 scheduler.add_task("cache_cleanup",        lambda: (quote_cache.cleanup(), chain_cache.cleanup()), interval=60)
 scheduler.add_task("archive_chains",       _archive_chains,                      interval=300)
 scheduler.add_task("monitor_paper_trades", _monitor_paper_trades,                interval=10)
+scheduler.add_task("auto_relogin_fyers",   _auto_relogin_fyers,                  interval=300)
 scheduler.start()
 
 # ---------------------------------------------------------------------------

@@ -111,6 +111,25 @@ def save_token_to_env(token):
         f.writelines(lines)
     print("Step 6: Token saved to .env")
 
+def renew_token() -> str:
+    """
+    Runs the full proven auto-login flow (steps 1-6 above, unchanged) and
+    returns the fresh access token — already persisted to .env by
+    save_token_to_env(). Raises the same exceptions the individual steps
+    already raise on failure, so a caller (e.g. server.py's scheduler
+    task) can log the exact reason without needing its own copy of this
+    sequence.
+
+    This is the same sequence main() below runs — extracted here so it
+    has exactly one implementation instead of two, and so it's callable
+    programmatically (returns the token) rather than only printable.
+    """
+    internal_token = auto_login_get_access_token()
+    auth_code = exchange_for_authcode(internal_token)
+    api_token = get_final_access_token(auth_code)
+    save_token_to_env(api_token)
+    return api_token
+
 def main():
     print("=" * 50)
     print("  Fyers Auto Token Generator")
@@ -124,10 +143,7 @@ def main():
         print("Missing in .env:", ", ".join(missing))
         return
     try:
-        internal_token = auto_login_get_access_token()
-        auth_code = exchange_for_authcode(internal_token)
-        api_token = get_final_access_token(auth_code)
-        save_token_to_env(api_token)
+        renew_token()
         print("=" * 50)
         print("  SUCCESS - Token renewed!")
         print("  Restart server.py now.")
